@@ -1,0 +1,108 @@
+# Конфиг источников-каталогов (шаг [2] пайплайна — генерация кандидатов).
+#
+# ВАЖНО: CSS-селекторы ниже помечены как PLACEHOLDER. Среда, в которой
+# написан этот прототип, не имеет сетевого доступа к pulscen.ru и optlist.ru
+# (см. docs/design_doc.md, §11), поэтому селекторы — предположение по
+# типовой вёрстке подобных B2B-каталогов, а НЕ проверенные вживую значения.
+#
+# Как откалибровать (см. README.md, "Калибровка селекторов"):
+#   1. Открыть в браузере страницу поиска с тестовым запросом.
+#   2. DevTools (F12) -> Inspect на карточке компании в выдаче.
+#   3. Найти повторяющийся контейнер карточки -> вписать его селектор в
+#      `item_selector`.
+#   4. Внутри контейнера найти название/ссылку/телефон/адрес -> вписать в
+#      соответствующие поля.
+#   5. Прогнать `pytest tests/test_sources_live.py --run-live` (см. README)
+#      чтобы проверить, что селекторы что-то находят.
+#
+# Если сайт не даёт телефон в статичном HTML (подгрузка по клику/JS) —
+# CSS-селектор для phone работать не будет, потребуется headless-браузер
+# (Playwright) вместо requests. Это отдельная задача, см. design_doc.md §11.
+
+pulscen:
+  base_url: "https://www.pulscen.ru"
+  search_url_template: "https://www.pulscen.ru/search?query={query}"
+  request_delay_seconds: 2.0
+  timeout_seconds: 15
+  # Браузероподобный UA, а не "...ProcurementSearchBot..." — многие WAF
+  # (Cloudflare и аналоги) блокируют по факту самоидентификации бота ещё до
+  # заголовков. Компенсируем этичность соблюдением robots.txt и паузой
+  # между запросами (см. ниже), а не притворством дальше UA.
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  respect_robots_txt: true
+  max_results_per_query: 30
+  # PLACEHOLDER — требует калибровки на живой странице
+  selectors:
+    item_selector: "div.company-item, div[data-qa='search-item'], article.item-card"
+    name_selector: "a.company-item__name, h3 a, .item-card__title a"
+    link_selector: "a.company-item__name, h3 a, .item-card__title a"
+    phone_selector: ".company-item__phone, .item-card__phone, [data-qa='phone']"
+    address_selector: ".company-item__address, .item-card__address"
+    description_selector: ".company-item__description, .item-card__snippet"
+    # опционально: ссылка на СОБСТВЕННЫЙ сайт компании (не профиль в каталоге).
+    # Если каталог её не показывает отдельным элементом — оставить пустым,
+    # дедуп по домену для этого источника тогда работает только по email.
+    website_selector: ""
+
+optlist:
+  base_url: "https://optlist.ru"
+  search_url_template: "https://optlist.ru/search/?q={query}"
+  request_delay_seconds: 2.0
+  timeout_seconds: 15
+  # Браузероподобный UA, а не "...ProcurementSearchBot..." — многие WAF
+  # (Cloudflare и аналоги) блокируют по факту самоидентификации бота ещё до
+  # заголовков. Компенсируем этичность соблюдением robots.txt и паузой
+  # между запросами (см. ниже), а не притворством дальше UA.
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  respect_robots_txt: true
+  max_results_per_query: 30
+  # PLACEHOLDER — требует калибровки на живой странице
+  selectors:
+    item_selector: "div.company-card, div.catalog-item, li.search-result-item"
+    name_selector: ".company-card__title a, .catalog-item__name a"
+    link_selector: ".company-card__title a, .catalog-item__name a"
+    phone_selector: ".company-card__phone, .catalog-item__phone"
+    address_selector: ".company-card__address, .catalog-item__address"
+    description_selector: ".company-card__desc, .catalog-item__desc"
+    website_selector: ""
+
+# Общий веб-поиск (design_doc §3, канал "весь интернет" — расширение за
+# пределы обязательных pulscen.ru/optlist.ru). Без селекторов: разметка
+# результатов DuckDuckGo фиксирована и парсится в sources/duckduckgo.py
+# напрямую, а не через конфиг (в отличие от каталогов, тут не нужна
+# калибровка под конкретный сайт — сайт всегда один).
+duckduckgo:
+  base_url: "https://duckduckgo.com"
+  search_url_template: "https://html.duckduckgo.com/html/?q={query}"
+  request_delay_seconds: 2.0
+  timeout_seconds: 15
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  respect_robots_txt: true
+  max_results_per_query: 15
+  selectors: {}
+
+# Google Custom Search JSON API — официальный канал "поиск по всему
+# интернету" (ТЗ п.4 "зарубежные источники, в т.ч. Alibaba"), см.
+# sources/google_cse.py про то, почему официальный API, а не скрапинг
+# выдачи. Ключ и Search Engine ID НЕ хранятся здесь — только через
+# переменные окружения GOOGLE_CSE_API_KEY / GOOGLE_CSE_CX (см. README).
+# Без них источник просто отключён, без ошибки.
+google_cse:
+  request_delay_seconds: 1.0
+  timeout_seconds: 15
+  max_results_per_query: 10
+
+# Yandex Search API (Yandex Cloud) — платный, но принимает российские карты
+# и лучше подходит под RU-рынок, см. sources/yandex_search.py про то, почему
+# он появился как альтернатива Google CSE. Ключ и folder_id — только через
+# переменные окружения YANDEX_SEARCH_API_KEY / YANDEX_FOLDER_ID (см. README).
+yandex_search:
+  request_delay_seconds: 1.0
+  timeout_seconds: 15
+  max_results_per_query: 10
+  poll_interval_seconds: 1.0
+  poll_timeout_seconds: 20
+  # Добавляет "(поставщик | производитель | оптом)" к запросу перед отправкой
+  # в Yandex — проверено вживую: без этого выдача склоняется к розничным
+  # маркетплейсам (Ozon, Wildberries), с этим — к опту/производителям.
+  enrich_query: true

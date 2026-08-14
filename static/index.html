@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Поиск поставщиков</title>
+<style>
+  :root {
+    --bg: #f8fafc;
+    --panel: #ffffff;
+    --border: #e2e8f0;
+    --text: #1e293b;
+    --muted: #64748b;
+    --accent: #1f2937;
+    --confirmed: #d1fae5;
+    --confirmed-text: #065f46;
+    --unverified: #fef3c7;
+    --unverified-text: #92400e;
+    --stale: #fee2e2;
+    --stale-text: #991b1b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    background: var(--accent);
+    color: #fff;
+    padding: 20px 24px;
+  }
+  header h1 { margin: 0; font-size: 1.25rem; }
+  header p { margin: 4px 0 0; color: #cbd5e1; font-size: 0.85rem; }
+  main {
+    max-width: 1100px;
+    margin: 24px auto;
+    padding: 0 16px 48px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }
+  section.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  .search-form {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .search-form input[type="text"] {
+    flex: 1;
+    min-width: 260px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.95rem;
+  }
+  .search-form label {
+    font-size: 0.85rem;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  button {
+    padding: 10px 18px;
+    border: none;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.95rem;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.secondary {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    font-size: 0.85rem;
+  }
+  #status { color: var(--muted); font-size: 0.9rem; min-height: 1.2em; }
+  #status.error { color: var(--stale-text); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    white-space: nowrap;
+  }
+  .badge.confirmed { background: var(--confirmed); color: var(--confirmed-text); }
+  .badge.unverified { background: var(--unverified); color: var(--unverified-text); }
+  .badge.stale { background: var(--stale); color: var(--stale-text); }
+  .muted { color: var(--muted); }
+  .score-total { font-weight: 700; }
+  .table-wrap { overflow-x: auto; }
+  .panel h2 { margin: 0 0 14px; font-size: 1.05rem; }
+  a.download { color: var(--accent); text-decoration: none; font-weight: 600; }
+  a.download:hover { text-decoration: underline; }
+  .empty { color: var(--muted); font-size: 0.9rem; padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Поиск поставщиков — прототип ИИ в закупках</h1>
+  <p>Пайплайн: нормализация запроса → pulscen.ru / optlist.ru → дедуп → скоринг → отчёт</p>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Новый поиск</h2>
+    <form class="search-form" id="search-form">
+      <input type="text" id="query" placeholder="Например: гальванические покрытия" required>
+      <label><input type="checkbox" id="use-llm"> LLM-fallback категории (нужен ANTHROPIC_API_KEY/Ollama)</label>
+      <label><input type="checkbox" id="deep-relevance"> Слой 2: краулить сайты кандидатов (медленнее, точнее)</label>
+      <label><input type="checkbox" id="relevance-llm-check"> Слой 3: LLM-проверка релевантности (нужен deep_relevance)</label>
+      <button type="submit" id="submit-btn">Найти</button>
+    </form>
+    <div id="status"></div>
+  </section>
+
+  <section class="panel" id="results-panel" style="display:none">
+    <h2>Результаты <span id="results-meta" class="muted"></span></h2>
+    <div class="table-wrap">
+      <table id="results-table">
+        <thead>
+          <tr>
+            <th>Компания</th>
+            <th>Телефон</th>
+            <th>Email</th>
+            <th>Адрес</th>
+            <th>Сайт</th>
+            <th>Источники</th>
+            <th>Relevance</th>
+            <th>Trust</th>
+            <th>Данные</th>
+            <th>Score</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>История отчётов</h2>
+    <div class="table-wrap">
+      <table id="reports-table">
+        <thead>
+          <tr>
+            <th>Запрос</th>
+            <th>Дата</th>
+            <th>Компаний</th>
+            <th>Файл</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="empty" id="reports-empty" style="display:none">Пока нет ни одного отчёта.</div>
+  </section>
+</main>
+
+<script>
+const statusEl = document.getElementById('status');
+const form = document.getElementById('search-form');
+const submitBtn = document.getElementById('submit-btn');
+const resultsPanel = document.getElementById('results-panel');
+const resultsMeta = document.getElementById('results-meta');
+const resultsBody = document.querySelector('#results-table tbody');
+const reportsBody = document.querySelector('#reports-table tbody');
+const reportsEmpty = document.getElementById('reports-empty');
+
+function badge(confidence) {
+  const map = {
+    'подтверждён': 'confirmed',
+    'не проверен': 'unverified',
+    'протух': 'stale',
+  };
+  const cls = map[confidence] || 'unverified';
+  return `<span class="badge ${cls}">${confidence || 'нет данных'}</span>`;
+}
+
+function fieldCell(field) {
+  if (!field) return '<span class="muted">—</span>';
+  return `${field.value}<br>${badge(field.confidence)}`;
+}
+
+function websiteCell(field) {
+  if (!field) return '<span class="muted">—</span>';
+  const url = field.value;
+  return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a><br>${badge(field.confidence)}`;
+}
+
+function renderResults(companies) {
+  resultsBody.innerHTML = '';
+  for (const c of companies) {
+    const tr = document.createElement('tr');
+    const score = c.score ? c.score.total.toFixed(3) : '—';
+    const relevance = c.score ? c.score.relevance.toFixed(2) : '—';
+    const trust = c.score ? c.score.trust.toFixed(2) : '—';
+    const confidence = c.score ? c.score.confidence.toFixed(2) : '—';
+    tr.innerHTML = `
+      <td><strong>${c.name}</strong><br><span class="muted">${c.status}</span></td>
+      <td>${fieldCell(c.phone)}</td>
+      <td>${fieldCell(c.email)}</td>
+      <td>${fieldCell(c.address)}</td>
+      <td>${websiteCell(c.website)}</td>
+      <td>${c.sources.join(', ')}</td>
+      <td>${relevance}</td>
+      <td>${trust}</td>
+      <td>${confidence}</td>
+      <td class="score-total">${score}</td>
+    `;
+    resultsBody.appendChild(tr);
+  }
+  resultsPanel.style.display = companies.length ? '' : 'none';
+}
+
+async function loadReports() {
+  const resp = await fetch('/api/reports');
+  const reports = await resp.json();
+  reportsBody.innerHTML = '';
+  reportsEmpty.style.display = reports.length ? 'none' : '';
+  for (const r of reports) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${r.query}</td>
+      <td class="muted">${new Date(r.created_at).toLocaleString('ru-RU')}</td>
+      <td>${r.companies_count}</td>
+      <td><a class="download" href="/api/reports/${encodeURIComponent(r.filename)}">Скачать .xlsx</a></td>
+    `;
+    reportsBody.appendChild(tr);
+  }
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const query = document.getElementById('query').value.trim();
+  if (!query) return;
+  const useLlm = document.getElementById('use-llm').checked;
+  const deepRelevance = document.getElementById('deep-relevance').checked;
+  const relevanceLlmCheck = document.getElementById('relevance-llm-check').checked;
+
+  submitBtn.disabled = true;
+  statusEl.className = '';
+  statusEl.textContent = deepRelevance
+    ? 'Идёт поиск и краулинг сайтов кандидатов — это может занять несколько минут…'
+    : 'Идёт поиск…';
+  resultsPanel.style.display = 'none';
+
+  try {
+    const resp = await fetch('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        use_llm_fallback: useLlm,
+        deep_relevance: deepRelevance,
+        relevance_llm_check: relevanceLlmCheck,
+      }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `Ошибка ${resp.status}`);
+    }
+    const data = await resp.json();
+    statusEl.textContent = `Готово: найдено ${data.companies.length} компаний.`;
+    resultsMeta.textContent = `— «${data.report.query}»`;
+    renderResults(data.companies);
+    await loadReports();
+  } catch (err) {
+    statusEl.className = 'error';
+    statusEl.textContent = 'Ошибка: ' + err.message;
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+
+loadReports();
+</script>
+</body>
+</html>

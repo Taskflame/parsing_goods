@@ -1,0 +1,61 @@
+# Веса скоринговой формулы (см. scoring.py):
+#   score = relevance^relevance_exponent × trust^trust_exponent
+#           × (confidence_base + (1 - confidence_base) × confidence)
+#
+# Мультипликативно, не суммой — нулевая релевантность не должна
+# вытягиваться за счёт большого/старого trust. relevance_exponent >
+# trust_exponent по умолчанию — на равном проигрыше релевантность
+# наказывается слабее (лучше показать профильного, но не идеально
+# проверенного поставщика, чем безупречное юрлицо не из той отрасли).
+#
+# trust_signal_weights — веса под-сигналов внутри trust (compute_trust в
+# scoring.py), тоже per-категорийно: для "лабораторных услуг" отсутствие
+# резолвинга в ЕГРЮЛ (inn_resolved) должно весить сильнее, чем для
+# категорий, где регистрация "как попало" — обычное дело. Сумма весов
+# под-сигналов не обязана быть 1.0 — compute_trust сам нормирует по
+# фактически найденным сигналам (см. _weighted_average).
+#
+# Категория без переопределения использует "default".
+
+default:
+  relevance_exponent: 0.6
+  trust_exponent: 0.4
+  confidence_base: 0.5
+  trust_signal_weights:
+    status: 0.35
+    website_alive: 0.15
+    inn_resolved: 0.15
+    years_in_business: 0.15
+    employees: 0.10
+    revenue: 0.10
+
+Лабораторные_услуги:
+  # аккредитация/лицензия для лабораторий — почти отсекающий фактор;
+  # реестра Росаккредитации в прототипе ещё нет (см. scoring.py), поэтому
+  # пока компенсируем через больший вес на резолвинг в ЕГРЮЛ и статус —
+  # честный ИНН/статус хотя бы отсекает совсем случайные компании
+  relevance_exponent: 0.55
+  trust_exponent: 0.45
+  confidence_base: 0.5
+  trust_signal_weights:
+    status: 0.30
+    website_alive: 0.10
+    inn_resolved: 0.30
+    years_in_business: 0.15
+    employees: 0.10
+    revenue: 0.05
+
+Утилизация_отходов:
+  # без лицензии Росприроднадзора кандидат нерелевантен вообще, независимо
+  # от масштаба компании — реестра лицензий в прототипе ещё нет, поэтому
+  # аналогично лабораториям налегаем на статус/ИНН как суррогат
+  relevance_exponent: 0.5
+  trust_exponent: 0.5
+  confidence_base: 0.5
+  trust_signal_weights:
+    status: 0.35
+    website_alive: 0.10
+    inn_resolved: 0.30
+    years_in_business: 0.15
+    employees: 0.05
+    revenue: 0.05
