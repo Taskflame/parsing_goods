@@ -20,6 +20,20 @@ class VerificationFlag(str, Enum):
     STALE = "протух"
 
 
+class StockStatus(str, Enum):
+    """Наличие товара на сайте кандидата — отдельный флаг от VerificationFlag
+    (не про достоверность контакта, а про факт "товар закончился"). Заполняется
+    только Слоем 3 (см. relevance_llm.classify_stock_status, pipeline._refine_relevance)
+    и намеренно НЕ участвует в scoring.py: это информационная плашка для байера
+    в духе "сайт жив/протух" (verify_contacts.py), а не сигнал доверия/релевантности —
+    результат может устареть быстрее, чем следующий перезапуск поиска, и жёстко
+    понижать/выкидывать поставщика по нему было бы неоправданно."""
+
+    IN_STOCK = "в наличии"
+    OUT_OF_STOCK = "нет в наличии"
+    NOT_CHECKED = "не проверено"
+
+
 @dataclass(frozen=True)
 class FieldValue:
     """Одно значение поля с происхождением — источник, дата, достоверность.
@@ -92,3 +106,4 @@ class Company:
     raw_candidates: list[Candidate] = field(default_factory=list)
 
     score: ScoreBreakdown | None = None
+    stock_status: StockStatus = StockStatus.NOT_CHECKED

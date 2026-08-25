@@ -40,15 +40,38 @@ from __future__ import annotations
 import math
 import re
 
+import snowballstemmer
+
+from procurement_search.attribute_extractor import ExtractedAttribute, extract_attributes
 from procurement_search.config import load_scoring_weights
 from procurement_search.models import Company, FieldValue, ScoreBreakdown, VerificationFlag
 from procurement_search.query_normalizer import NormalizedQuery
+
+# Насколько может отличаться значение атрибута на сайте кандидата от
+# запрошенного, прежде чем это считается несоответствием, а не разумной
+# вариацией ("лучше — не хуже", design-обсуждение: 12000 л/ч на сайте для
+# запроса "10000 л/час" — это НЕ несоответствие, ratio=1.2; а 18 л/ч —
+# несоответствие, ratio=0.0018). Симметричный множитель: за пределами
+# [1/x, x] от запрошенного значения.
+_ATTRIBUTE_MISMATCH_RATIO = 2.0
 
 # Порядок альтернатив важен: дробное число (напр. "2,5") должно матчиться
 # раньше отдельных цифр, иначе "2,5 квт" разваливается на токены "2" и "5" —
 # два несвязанных однозначных числа, которые совпадают почти с чем угодно
 # (телефоны, годы, другие мощности) и на практике убивают сигнал атрибута.
 _TOKEN_RE = re.compile(r"[а-яa-zё]+|\d+[.,]\d+|\d+", re.IGNORECASE)
+
+# Стемминг русских словоформ ("частотный" -> "частотн", "частоты" -> "частот")
+# — без него токенное пересечение сравнивает точные строки, а склонение
+# делает "преобразователь"/"преобразователи" разными токенами (design-
+# обсуждение: реальный кейс, где карточка с полным текстовым совпадением
+# по смыслу получала relevance около нуля просто из-за формы слова).
+# snowballstemmer — чистый Python, без словарей/компиляции, ровно для этой
+# задачи. НЕ лемматизация: склеивает только словоизменение одного слова,
+# не объединяет однокоренные, но грамматически разные слова ("частотный" —
+# прилагательное, "частоты" — форма другого слова "частота"; это разная
+# лексика с общим смыслом, стемминг такое не унифицирует).
+_RU_STEMMER = snowballstemmer.stemmer("russian")
 
 # Порядок и веса по умолчанию для сигналов trust — переопределяются per-
 # категорийно через scoring_weights.yaml -> <категория>.trust_signal_weights.
@@ -81,23 +104,47 @@ _CONFIDENCE_FIELDS = 10
 def _tokenize(text: str) -> set[str]:
     # "," -> "." после матчинга, чтобы "2,5" (запрос) и "2.5" (текст сайта)
     # считались одним и тем же токеном независимо от формата разделителя.
-    return {t.lower().replace(",", ".") for t in _TOKEN_RE.findall(text)}
+    raw_tokens = [t.lower().replace(",", ".") for t in _TOKEN_RE.findall(text)]
+    # Числа не стеммируем (это операция над словами, не над цифрами) —
+    # отделяем их от слов до вызова стеммера.
+    words = [t for t in raw_tokens if not t[0].isdigit()]
+    numbers = [t for t in raw_tokens if t[0].isdigit()]
+    stemmed = _RU_STEMMER.stemWords(words) if words else []
+    return set(stemmed) | set(numbers)
 
 
-def query_tokens(normalized_query: NormalizedQuery) -> set[str]:
+def query_tokens(normalized_query: NormalizedQuery, clean_query_text: str | None = None) -> set[str]:
     """Множество токенов запроса — общее для Слоя 1 (здесь) и Слоя 2
-    (site_relevance.py), чтобы не дублировать токенизацию в двух местах."""
+    (site_relevance.py), чтобы не дублировать токенизацию в двух местах.
+
+    `clean_query_text` — результат attribute_extractor.extract_attributes(
+    raw_query).clean_text (Слой 0): сырой запрос без чисел и слов единиц
+    измерения. Если передан, подменяет собой raw_query (всегда первый
+    элемент search_terms, см. query_normalizer.normalize_query) —
+    остальные search_terms (категория, синонимы) не трогаем, они и так
+    без чисел. Без этого голые числа запроса ("5.5", "380") сравниваются
+    как обычные слова и совпадают почти с любым сайтом той же товарной
+    группы (design-обсуждение) — числовое соответствие проверяется
+    отдельно, в has_attribute_mismatch, где сравнивается СМЫСЛ значения
+    (та же единица измерения), а не совпадение случайной цифры."""
+    terms = list(normalized_query.search_terms)
+    if clean_query_text is not None and terms:
+        terms[0] = clean_query_text
     tokens: set[str] = set()
-    for term in normalized_query.search_terms:
+    for term in terms:
         tokens |= _tokenize(term)
     return tokens
 
 
-def compute_relevance(company: Company, normalized_query: NormalizedQuery) -> float:
+def compute_relevance(
+    company: Company, normalized_query: NormalizedQuery, clean_query_text: str | None = None
+) -> float:
     """Слой 1: пересечение токенов запроса с текстом сниппетов кандидатов.
     Сниппет — то, что источник (Yandex/DDG/каталог) сам показал в выдаче,
-    не текст с сайта компании — грубее Слоя 2, но бесплатно и мгновенно."""
-    q_tokens = query_tokens(normalized_query)
+    не текст с сайта компании — грубее Слоя 2, но бесплатно и мгновенно.
+
+    `clean_query_text` — см. query_tokens."""
+    q_tokens = query_tokens(normalized_query, clean_query_text=clean_query_text)
     if not q_tokens:
         return 0.0
 
@@ -244,13 +291,97 @@ def weights_for_category(category: str | None, weights_cfg: dict) -> dict:
     return weights_cfg.get(category or "default", weights_cfg["default"])
 
 
+_WEBSITE_DOMAIN_RE = re.compile(r"https?://(?:www\.)?([\w.\-]+)", re.IGNORECASE)
+
+
+def is_marketplace_domain(company: Company, marketplace_domains: list[str]) -> bool:
+    """Сайт компании — крупный B2C-маркетплейс/классифайд (см.
+    config/marketplace_domains.yaml), а не собственный сайт поставщика.
+
+    Не используется как штраф внутри score (compute_score) — это
+    отдельный сигнал для ранжирования финальной выдачи (pipeline.py):
+    такие компании не исключаются, а понижаются в приоритет, всплывая в
+    топе только когда с других источников не набралось достаточно
+    кандидатов (design-обсуждение: DNS/Ozon/Wildberries для B2B-закупки —
+    не поставщик, а розница/перекупщик, но лучше показать их, чем ничего)."""
+    website_entries = company.contacts.get("website", [])
+    if not website_entries:
+        return False
+    match = _WEBSITE_DOMAIN_RE.search(website_entries[0].value)
+    if match is None:
+        return False
+    domain = match.group(1).lower()
+    return any(domain == d or domain.endswith("." + d) for d in marketplace_domains)
+
+
+def has_attribute_mismatch(
+    company: Company, query_attributes: list[ExtractedAttribute], units: dict | None = None
+) -> bool:
+    """Слой 0.5 (design-обсуждение — довязка attribute_extractor.py,
+    которая раньше нигде не вызывалась): числовая характеристика из
+    запроса ("10000 л/час") явно противоречит тому, что упомянуто в
+    сниппете кандидата ("18 л/ч"), даже если по токенам название товара
+    совпадает полностью.
+
+    Атрибуты сайта извлекаются той же extract_attributes, что и у
+    запроса, но БЕЗ LLM-fallback (use_llm_fallback не передаётся) —
+    зовётся на каждого кандидата, а не один раз на запрос, поэтому должна
+    быть дешёвой; "голые" числа на сайте без единицы рядом просто
+    игнорируются, а не гадаются моделью.
+
+    Не исключает и не заменяет relevance_llm.check_attribute_match (Слой
+    3, тоже LLM, но по полному тексту сайта, не по сниппету) — тот точнее,
+    но платный и только для top-N при --deep-relevance. Эта функция —
+    бесплатный грубый фильтр для ВСЕХ кандидатов на Слое 1: сравнение
+    исключительно по совпадающей единице измерения, поэтому осторожная
+    (см. _ATTRIBUTE_MISMATCH_RATIO) — ложное совпадение случайного числа
+    на сайте с той же единицей возможно, штрафуем relevance, а не
+    выкидываем компанию целиком.
+
+    Отсутствие атрибута на сайте (extract_attributes ничего не нашла) —
+    НЕ несоответствие, тот же принцип "нет данных — не штраф", что и
+    везде в scoring.py."""
+    if not query_attributes:
+        return False
+    text_parts = [company.name.value]
+    for candidate in company.raw_candidates:
+        if candidate.description_raw:
+            text_parts.append(candidate.description_raw)
+    site_attributes = extract_attributes(" ".join(text_parts), units=units).attributes
+
+    for q_attr in query_attributes:
+        try:
+            q_value = float(q_attr.value)
+        except ValueError:
+            continue
+        if q_value <= 0:
+            continue
+        for s_attr in site_attributes:
+            if s_attr.unit != q_attr.unit:
+                continue
+            try:
+                s_value = float(s_attr.value)
+            except ValueError:
+                continue
+            if s_value <= 0:
+                continue
+            ratio = s_value / q_value
+            if ratio < 1 / _ATTRIBUTE_MISMATCH_RATIO or ratio > _ATTRIBUTE_MISMATCH_RATIO:
+                return True
+    return False
+
+
 def compute_score(
-    company: Company, normalized_query: NormalizedQuery, weights: dict | None = None
+    company: Company,
+    normalized_query: NormalizedQuery,
+    weights: dict | None = None,
+    clean_query_text: str | None = None,
 ) -> ScoreBreakdown:
+    """`clean_query_text` — см. compute_relevance/query_tokens."""
     weights_cfg = weights if weights is not None else load_scoring_weights()
     w = weights_for_category(normalized_query.category, weights_cfg)
 
-    relevance = compute_relevance(company, normalized_query)
+    relevance = compute_relevance(company, normalized_query, clean_query_text=clean_query_text)
     trust = compute_trust(company, w)
     confidence = compute_confidence(company)
     total = combine_score(relevance, trust, confidence, w)

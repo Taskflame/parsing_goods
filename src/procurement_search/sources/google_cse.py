@@ -17,7 +17,7 @@
      programmablesearchengine.google.com -> создать -> Search engine ID.
 
 Обе переменные окружения — GOOGLE_CSE_API_KEY и GOOGLE_CSE_CX. Как и
-DADATA_API_KEY/ANTHROPIC_API_KEY в остальном проекте, источник включается
+DADATA_API_KEY/YANDEX_FM_API_KEY в остальном проекте, источник включается
 наличием переменных в окружении, без правки кода (см.
 pipeline._default_enricher про тот же паттерн).
 """
@@ -32,7 +32,7 @@ from datetime import date
 import requests
 
 from procurement_search.models import Candidate
-from procurement_search.sources.base import EMAIL_RE, PHONE_RE, first_match
+from procurement_search.sources.base import EMAIL_RE, PHONE_RE, SUPPLIER_QUERY_SUFFIX, first_match
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +44,10 @@ MAX_RESULTS_PER_REQUEST = 10
 class GoogleCseSource:
     """Источник "поиск по всему интернету" через Google Custom Search JSON API.
 
-    Как и DuckDuckGoSource, отдаёт только заголовок/ссылку/сниппет — без
-    отдельных полей телефон/email от API, извлекаем регексом из сниппета.
-    Часть контактных полей у таких кандидатов останется пустой — это
-    честно отражает то, что источник даёт (design_doc §1), а не выдумка.
+    Отдаёт только заголовок/ссылку/сниппет — без отдельных полей телефон/
+    email от API, извлекаем регексом из сниппета. Часть контактных полей у
+    таких кандидатов останется пустой — это честно отражает то, что
+    источник даёт (design_doc §1), а не выдумка.
     """
 
     def __init__(
@@ -58,6 +58,7 @@ class GoogleCseSource:
         timeout: float = 15.0,
         request_delay_seconds: float = 1.0,
         max_results_per_query: int = MAX_RESULTS_PER_REQUEST,
+        enrich_query: bool = True,
         session: requests.Session | None = None,
     ):
         if not api_key or not cx:
@@ -70,7 +71,11 @@ class GoogleCseSource:
         self.timeout = timeout
         self.request_delay_seconds = request_delay_seconds
         self.max_results_per_query = min(max_results_per_query, MAX_RESULTS_PER_REQUEST)
+        self.enrich_query = enrich_query
         self.session = session or requests.Session()
+
+    def _build_query_text(self, query: str) -> str:
+        return query + SUPPLIER_QUERY_SUFFIX if self.enrich_query else query
 
     def search(self, query: str) -> list[Candidate]:
         try:
@@ -79,7 +84,7 @@ class GoogleCseSource:
                 params={
                     "key": self.api_key,
                     "cx": self.cx,
-                    "q": query,
+                    "q": self._build_query_text(query),
                     "num": self.max_results_per_query,
                 },
                 timeout=self.timeout,
@@ -132,4 +137,5 @@ def build_default(config_dict: dict) -> GoogleCseSource | None:
         timeout=float(cfg.get("timeout_seconds", 15.0)),
         request_delay_seconds=float(cfg.get("request_delay_seconds", 1.0)),
         max_results_per_query=int(cfg.get("max_results_per_query", MAX_RESULTS_PER_REQUEST)),
+        enrich_query=bool(cfg.get("enrich_query", True)),
     )

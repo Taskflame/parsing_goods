@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
-from procurement_search.models import Company, VerificationFlag
+from procurement_search.models import Company, StockStatus, VerificationFlag
 
 _HEADER_FILL = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
 _HEADER_FONT = Font(color="FFFFFF", bold=True)
@@ -31,6 +31,16 @@ _FLAG_FILL = {
     ),
 }
 
+# Отдельная палитра от _FLAG_FILL: NOT_CHECKED — это не "недостоверно", а
+# "не проверялось вовсе" (Слой 3 не запускался — deep_relevance/
+# relevance_llm_check выключены или LLM недоступна), поэтому нейтральный
+# серый, а не жёлтый "не проверен" из VerificationFlag.
+_STOCK_FILL = {
+    StockStatus.IN_STOCK: PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid"),
+    StockStatus.OUT_OF_STOCK: PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
+    StockStatus.NOT_CHECKED: PatternFill(start_color="E5E7EB", end_color="E5E7EB", fill_type="solid"),
+}
+
 _COLUMNS = [
     ("Компания", 32),
     ("ИНН", 14),
@@ -44,6 +54,7 @@ _COLUMNS = [
     ("Сайт", 26),
     ("Сайт: источник/дата", 26),
     ("Источники (каталоги)", 20),
+    ("Наличие товара", 16),
     ("Score: релевантность", 12),
     ("Score: доверие", 12),
     ("Score: полнота данных", 14),
@@ -74,12 +85,13 @@ def export_companies_to_excel(companies: list[Company], output_path: str | Path)
     ws.title = "Поставщики"
     _write_header(ws)
 
-    # ранжирование по итоговому score, если посчитан
-    ordered = sorted(
-        companies, key=lambda c: c.score.total if c.score else 0.0, reverse=True
-    )
-
-    for row_idx, company in enumerate(ordered, start=2):
+    # Порядок берётся как есть, БЕЗ пересортировки по чистому score.total —
+    # вызывающий код (pipeline.search_and_score) уже отсортировал компании
+    # правильно, включая нечисловые правила ранжирования поверх score
+    # (например, деприоритизация маркетплейсов в pipeline._ranking_key,
+    # которая должна пересиливать более высокий score — пересортировка
+    # здесь тихо стирала бы такие правила, реально это уже случалось).
+    for row_idx, company in enumerate(companies, start=2):
         phone_val, phone_src, phone_flag = _field_summary(company.contacts.get("phone", []))
         email_val, email_src, email_flag = _field_summary(company.contacts.get("email", []))
         addr_val, addr_src, addr_flag = _field_summary(company.contacts.get("address", []))
@@ -99,6 +111,7 @@ def export_companies_to_excel(companies: list[Company], output_path: str | Path)
             site_val,
             site_src,
             ", ".join(company.sources),
+            company.stock_status.value,
             round(score.relevance, 3) if score else "",
             round(score.trust, 3) if score else "",
             round(score.confidence, 3) if score else "",
@@ -109,6 +122,9 @@ def export_companies_to_excel(companies: list[Company], output_path: str | Path)
 
         for col_idx, flag in ((4, phone_flag), (6, email_flag), (8, addr_flag), (10, site_flag)):
             ws.cell(row=row_idx, column=col_idx).fill = _FLAG_FILL[flag]
+
+        # "Наличие товара" — 13-я колонка (см. _COLUMNS): после "Источники (каталоги)".
+        ws.cell(row=row_idx, column=13).fill = _STOCK_FILL[company.stock_status]
 
     output_path = Path(output_path)
     wb.save(output_path)

@@ -39,7 +39,7 @@ from datetime import date
 import requests
 
 from procurement_search.models import Candidate
-from procurement_search.sources.base import EMAIL_RE, PHONE_RE, first_match
+from procurement_search.sources.base import EMAIL_RE, PHONE_RE, SUPPLIER_QUERY_SUFFIX, first_match
 
 logger = logging.getLogger(__name__)
 
@@ -47,22 +47,13 @@ SEARCH_URL = "https://searchapi.api.cloud.yandex.net/v2/web/searchAsync"
 OPERATION_URL_TEMPLATE = "https://operation.api.cloud.yandex.net/operations/{operation_id}"
 DEFAULT_MAX_RESULTS = 10
 
-# B2B-обогащение запроса (ТЗ: нужны поставщики, а не розница) — проверено
-# вживую на реальном ключе: без этого суффикса "генератор бензиновый 5 квт"
-# отдавал Ozon/Wildberries/DNS-shop (розничные категорийные страницы), с
-# ним — patriot-opt.ru, tss-sklad.ru, официальные сайты производителей
-# (A-IPOWER, TSS). Оператор "|" (OR) поддерживается синтаксисом запросов
-# Yandex Search API и реально меняет ранжирование, а не просто добавляет
-# слова в текст запроса.
-SUPPLIER_QUERY_SUFFIX = " (поставщик | производитель | оптом)"
-
 
 class YandexSearchSource:
     """Источник "поиск по всему интернету" через Yandex Search API.
 
-    Как и GoogleCseSource/DuckDuckGoSource, отдаёт заголовок/ссылку/сниппет
-    без выделенных полей телефон/email — извлекаем регексом из сниппета
-    (описание того же честного компромисса — см. google_cse.py)."""
+    Как и GoogleCseSource, отдаёт заголовок/ссылку/сниппет без выделенных
+    полей телефон/email — извлекаем регексом из сниппета (описание того же
+    честного компромисса — см. google_cse.py)."""
 
     def __init__(
         self,

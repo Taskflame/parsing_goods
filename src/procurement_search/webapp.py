@@ -84,6 +84,7 @@ def _company_to_dict(company: Company) -> dict:
         "address": _field_to_dict(company.contacts.get("address", [])),
         "website": _field_to_dict(company.contacts.get("website", [])),
         "sources": company.sources,
+        "stock_status": company.stock_status.value,
         "score": (
             {
                 "relevance": round(score.relevance, 3),
@@ -156,6 +157,17 @@ if STATIC_DIR.is_dir():
 
 def main() -> None:
     import uvicorn
+    from dotenv import load_dotenv
+
+    # Подхватывает .env из корня проекта (см. .env.example), если он есть —
+    # явный `export` в шелле всё равно имеет приоритет (override=False по
+    # умолчанию), .env только подставляет то, что ещё не задано. Вызывается
+    # здесь, а не на уровне модуля — тесты (test_webapp.py) импортируют
+    # `app` напрямую и не должны неявно подхватывать окружение разработчика.
+    # Путь передаётся явно (не find_dotenv() по умолчанию) — см. cli.py про
+    # то же самое решение и его мотивацию (поиск по стеку вызовов/CWD на
+    # практике ненадёжен).
+    load_dotenv(PROJECT_ROOT / ".env")
 
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(app, host="127.0.0.1", port=8000)

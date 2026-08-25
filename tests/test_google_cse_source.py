@@ -83,7 +83,9 @@ def test_parses_items_into_candidates():
 
 def test_sends_key_cx_and_query():
     session = _FakeSession(_FakeResponse({"items": []}))
-    source = GoogleCseSource(api_key="my-key", cx="my-cx", session=session, request_delay_seconds=0.0)
+    source = GoogleCseSource(
+        api_key="my-key", cx="my-cx", session=session, request_delay_seconds=0.0, enrich_query=False
+    )
 
     source.search("test query")
 
@@ -91,6 +93,28 @@ def test_sends_key_cx_and_query():
     assert params["key"] == "my-key"
     assert params["cx"] == "my-cx"
     assert params["q"] == "test query"
+
+
+def test_enriches_query_with_supplier_terms_by_default():
+    session = _FakeSession(_FakeResponse({"items": []}))
+    source = GoogleCseSource(api_key="k", cx="c", session=session, request_delay_seconds=0.0)
+
+    source.search("генератор бензиновый 5 квт")
+
+    params = session.calls[0]["params"]
+    assert params["q"] == "генератор бензиновый 5 квт (поставщик | производитель | оптом)"
+
+
+def test_enrich_query_can_be_disabled():
+    session = _FakeSession(_FakeResponse({"items": []}))
+    source = GoogleCseSource(
+        api_key="k", cx="c", session=session, request_delay_seconds=0.0, enrich_query=False
+    )
+
+    source.search("генератор бензиновый 5 квт")
+
+    params = session.calls[0]["params"]
+    assert params["q"] == "генератор бензиновый 5 квт"
 
 
 def test_survives_network_error_without_crashing():

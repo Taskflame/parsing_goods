@@ -4,9 +4,24 @@ from fastapi.testclient import TestClient
 
 from procurement_search import pipeline, webapp
 from procurement_search.models import Candidate, VerificationFlag
-from procurement_search.sources.duckduckgo import DuckDuckGoSource
-from procurement_search.sources.optlist import OptlistSource
-from procurement_search.sources.pulscen import PulscenSource
+
+
+class _FakeSource:
+    """См. test_pipeline.py._FakeSource — pulscen.ru/optlist.ru/DuckDuckGo
+    убраны из активных источников, тесты подменяют build_yandex_search."""
+
+    def __init__(self, name: str, search_fn):
+        self.name = name
+        self._search_fn = search_fn
+
+    def search(self, query: str) -> list[Candidate]:
+        return self._search_fn(query)
+
+
+def _patch_sources(monkeypatch, search_fn, *, name: str = "yandex_search") -> None:
+    monkeypatch.setattr(pipeline, "build_yandex_search", lambda cfg: _FakeSource(name, search_fn))
+    monkeypatch.setattr(pipeline, "build_google_cse", lambda cfg: None)
+    monkeypatch.setattr(pipeline, "build_yandex_gen_search", lambda cfg: None)
 
 
 def _fake_candidates(source_name: str) -> list[Candidate]:
@@ -26,9 +41,7 @@ def _fake_candidates(source_name: str) -> list[Candidate]:
 def _client(monkeypatch, tmp_path) -> TestClient:
     monkeypatch.setattr(webapp, "REPORTS_DIR", tmp_path / "reports")
     monkeypatch.setattr(webapp, "INDEX_PATH", tmp_path / "reports" / "index.json")
-    monkeypatch.setattr(PulscenSource, "search", lambda self, query: _fake_candidates("pulscen"))
-    monkeypatch.setattr(OptlistSource, "search", lambda self, query: _fake_candidates("optlist"))
-    monkeypatch.setattr(DuckDuckGoSource, "search", lambda self, query: [])
+    _patch_sources(monkeypatch, lambda query: _fake_candidates("yandex_search"))
     return TestClient(webapp.app)
 
 
@@ -43,6 +56,7 @@ def test_search_returns_companies_and_creates_report(monkeypatch, tmp_path):
     assert data["companies"][0]["name"] == "ООО Гальванические покрытия"
     assert data["companies"][0]["phone"]["value"] == "+7 900 111 11 11"
     assert data["companies"][0]["phone"]["confidence"] == "не проверен"
+    assert data["companies"][0]["stock_status"] == "не проверено"
     assert data["report"]["query"] == "гальванические покрытия"
     assert (tmp_path / "reports" / data["report"]["filename"]).exists()
 
@@ -79,11 +93,11 @@ def test_download_rejects_path_traversal(monkeypatch, tmp_path):
 
 
 def test_search_includes_website_liveness_field(monkeypatch, tmp_path):
-    def fake_candidates_with_website(source_name: str) -> list[Candidate]:
+    def fake_candidates_with_website(query: str) -> list[Candidate]:
         return [
             Candidate(
-                source=source_name,
-                source_url=f"https://{source_name}.example/company/1",
+                source="yandex_search",
+                source_url="https://yandex_search.example/company/1",
                 name_raw="ООО Гальванические покрытия",
                 website="https://galvanika.ru",
             ),
@@ -91,11 +105,7 @@ def test_search_includes_website_liveness_field(monkeypatch, tmp_path):
 
     monkeypatch.setattr(webapp, "REPORTS_DIR", tmp_path / "reports")
     monkeypatch.setattr(webapp, "INDEX_PATH", tmp_path / "reports" / "index.json")
-    monkeypatch.setattr(
-        PulscenSource, "search", lambda self, query: fake_candidates_with_website("pulscen")
-    )
-    monkeypatch.setattr(OptlistSource, "search", lambda self, query: [])
-    monkeypatch.setattr(DuckDuckGoSource, "search", lambda self, query: [])
+    _patch_sources(monkeypatch, fake_candidates_with_website)
     monkeypatch.setattr(
         pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
     )

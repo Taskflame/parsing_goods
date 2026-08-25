@@ -7,16 +7,18 @@
 
 ## Что это и что нет
 
-Работает без сети (юнит-тесты, дедуп, скоринг, экспорт в Excel, поиск через
-DuckDuckGo). **Не** работает "из коробки" против pulscen.ru/optlist.ru —
-CSS-селекторы в `config/sources.yaml` не откалиброваны, потому что среда,
-где писался этот код, не имеет к этим сайтам сетевого доступа (design_doc
-§11). Это первое, что нужно сделать перед запуском на реальных данных —
-см. ниже.
+Работает без сети (юнит-тесты, дедуп, скоринг, экспорт в Excel). Реальный
+поиск кандидатов требует хотя бы один из платных источников ниже —
+Google CSE, Yandex Search API или Yandex gen-search (см. "Источники
+кандидатов и ключи API").
 
-Источники кандидатов — три: **pulscen.ru** и **optlist.ru** (обязательные
-по ТЗ, требуют калибровки селекторов) и **DuckDuckGo** (общий веб-поиск,
-работает сразу, без ключей и калибровки — см. `sources/duckduckgo.py`).
+pulscen.ru/optlist.ru (CatalogSource, CSS-селекторы) и DuckDuckGo убраны из
+проекта (design-обсуждение): у первых двух селекторы в `config/sources.yaml`
+так и остались неоткалиброванными PLACEHOLDER'ами с самого начала — среда, где
+писался этот код, не имела сетевого доступа к этим сайтам (design_doc §11),
+поэтому реальных кандидатов они не давали никогда; DuckDuckGo упёрся в
+JS-антибот-челлендж на html.duckduckgo.com (anomaly.js) — недоступен без
+браузера, исполняющего JavaScript.
 
 ## Установка
 
@@ -28,41 +30,79 @@ pip install -r requirements.txt
 `pyproject.toml` (`tool.pytest.ini_options.pythonpath`). Для запуска CLI вне
 pytest добавьте `src` в `PYTHONPATH`:
 
-### LLM-fallback для нормализации запроса (опционально)
+### LLM-fallback для запроса (опционально)
 
-`query_normalizer.normalize_query(..., use_llm_fallback=True)` подключает
-Claude (официальный `anthropic` Python SDK, `src/procurement_search/llm_classifier.py`)
-как fallback, если словарное совпадение по `config/categories.yaml` не
-нашло ни одного пересечения — например, байер написал запрос непривычной
-формулировкой. LLM выбирает категорию строго из уже существующего списка,
-а не придумывает новую — источником истины по ОКВЭД/реестрам остаётся
-справочник. По умолчанию выключен и не требует ни сети, ни ключа.
+`search_and_score(..., use_llm_fallback=True)` подключает LLM в двух точках
+Слоя 0, поверх дешёвого детерминированного пути, а не вместо него:
+- `attribute_extractor.py` — один batch-вызов на все "голые" числа запроса,
+  для которых словарь `config/units.yaml` не нашёл единицы измерения рядом
+  (опечатки/сокращения/склонения — "киловат" вместо "киловатт");
+- `brand_extractor.py` — извлекает бренд/производителя из запроса, если он
+  явно упомянут, для отдельного целевого поискового запроса.
 
-Чтобы включить: `export ANTHROPIC_API_KEY=...` (или `ant auth login`) и
-передать `use_llm_fallback=True` при вызове (в GUI — чекбокс). Модель по
-умолчанию — `claude-opus-5`, переопределяется через `ANTHROPIC_MODEL`
-(например, на `claude-haiku-4-5` для дешёвого высокочастотного вызова,
-если категорий станет не 4 тестовых, а сотни — это сознательный
-компромисс цена/качество, а не выбор по умолчанию).
+По умолчанию выключен и не требует ни сети, ни ключа.
 
-Anthropic API платный (без бесплатного тарифа). Есть бесплатная
-альтернатива — локальная модель через [Ollama](https://ollama.com), без
-API-ключа и без сети:
+Провайдер по умолчанию — `LLM_PROVIDER=yandexgpt`
+(`src/procurement_search/yandexgpt_classifier.py`): [Yandex AI Studio](https://yandex.cloud/ru/services/ai-studio)
+(Yandex Foundation Models), OpenAI-совместимый Chat Completions API
+(`llm.api.cloud.yandex.net/v1`) поверх моделей YandexGPT Pro/Lite.
 
 ```bash
-ollama pull llama3.2   # один раз, скачивает модель
-ollama serve            # обычно уже запущен как сервис после установки
-export LLM_PROVIDER=ollama
+export LLM_PROVIDER=yandexgpt
+export YANDEX_FM_API_KEY=...   # API-ключ Yandex AI Studio (НЕ YANDEX_SEARCH_API_KEY — другой сервис)
+export YANDEX_FM_MODEL=yandexgpt   # или yandexgpt-lite
+export YANDEX_FOLDER_ID=...    # нужен, если ещё не задан для Yandex Search API выше
 ```
 
-Дальше всё как обычно — `use_llm_fallback=True` подключит
-`src/procurement_search/ollama_classifier.py` вместо `llm_classifier.py`
-(тот же контракт `CategoryMatch`, переключение по `LLM_PROVIDER`, без
-правок кода). Модель по умолчанию `llama3.2`, переопределяется через
-`OLLAMA_MODEL`, адрес сервера — через `OLLAMA_URL` (по умолчанию
-`http://localhost:11434/api/generate`). Качество классификации у
-локальных моделей заметно ниже, чем у Claude — воспринимайте как
-черновой fallback, не как замену.
+Авторизация — обычный статический API-ключ (Bearer) через стандартный
+`openai` SDK, `response_format: json_schema` для структурированного
+вывода — тот же контракт, что и у cloud.ru ниже. Модель адресуется не
+голым ID, а URI вида `gpt://<FOLDER_ID>/<YANDEX_FM_MODEL>/latest`,
+который `yandexgpt_classifier.py` собирает сам из `YANDEX_FM_MODEL` +
+folder_id. Получить ключ: [Yandex AI Studio](https://yandex.cloud/ru/services/ai-studio)
+→ API-ключи → создать ключ.
+
+**Ключ Yandex AI Studio из другого аккаунта, чем `YANDEX_SEARCH_API_KEY`?**
+Search API и AI Studio — независимые сервисы Yandex Cloud, ничто не
+мешает завести их в разных аккаунтах/каталогах. По умолчанию folder_id
+для модели берётся из уже заданного `YANDEX_FOLDER_ID` (удобно для
+типового случая "один аккаунт на всё") — но если у AI Studio реально
+другой аккаунт, его folder_id туда не подойдёт (ошибка авторизации, как
+у 403 "Project not found" у cloud.ru). Для этого случая — отдельная
+переменная:
+
+```bash
+export YANDEX_FM_FOLDER_ID=...  # folder_id именно того аккаунта, где выпущен YANDEX_FM_API_KEY
+```
+
+**Запасной вариант на случай отката** — `LLM_PROVIDER=cloudru`
+(`src/procurement_search/cloudru_classifier.py`):
+[Cloud.ru Evolution Foundation Models](https://cloud.ru/products/evolution-foundation-models),
+OpenAI-совместимый API поверх 20+ моделей (GLM, Qwen, DeepSeek, MiniMax,
+GigaChat), регистрация без VPN и зарубежных карт, оплата по факту
+использования.
+
+```bash
+export LLM_PROVIDER=cloudru
+export CLOUDRU_API_KEY=...     # Key Secret из API-ключа (см. ниже, откуда взять)
+export CLOUDRU_MODEL=...       # точный ID модели из каталога Cloud.ru
+```
+
+Авторизация — обычный статический API-ключ (Bearer) —
+никакого обмена на IAM-токен не требуется, несмотря на то что так
+выглядело по README пакета `evolution-openai`, который сначала
+рассматривался для этой интеграции: на практике связка `key_id`/`secret`
+через IAM (`evolution-openai`) отдала `401 Unauthorized`, а обычный
+`openai` SDK с ключом из карточки модели — сработал. Получить ключ:
+Evolution → Foundation Models → карточка нужной модели → "Использовать" →
+создать API-ключ, оттуда взять Key Secret.
+
+Регистрация без VPN и зарубежных карт — но сам API
+(`foundation-models.api.cloud.ru`) может быть недоступен, если на вашей
+машине включён VPN/прокси с выходом за пределы РФ: наблюдалось вживую —
+`SSLEOFError`/обрыв TLS-рукопожатия при активном VPN (V2Ray/Xray-клиенты
+вроде V2Box — популярный случай), нормальная работа сразу после его
+отключения.
 
 ### Резолвинг в ЕГРЮЛ через Dadata — отсев неактуальных данных (опционально)
 
@@ -111,12 +151,11 @@ PYTHONPATH=src python3 -m procurement_search.cli --query "гальваничес
 
 ### Глобальный поиск и зарубежные источники (опционально)
 
-pulscen.ru/optlist.ru — специализированные RU-каталоги, а DuckDuckGo
-(`sources/duckduckgo.py`) на практике часто отдаёт капчу вместо результатов
-автоматическим клиентам — это защита самого DuckDuckGo, а не баг конфига.
 Для ТЗ п.4 "работать по зарубежным источникам (в т.ч. Alibaba)" и общего
 "поиска по всему интернету" используется `sources/google_cse.py` — Google
-Custom Search JSON API, официальный канал, не подверженный капчам.
+Custom Search JSON API, официальный канал, не подверженный капчам/антибот-
+защите (в отличие от скрапинга — см. выше, почему pulscen.ru/optlist.ru/
+DuckDuckGo убраны из проекта).
 
 Включается переменными окружения — код трогать не нужно:
 
@@ -187,9 +226,10 @@ PYTHONPATH=src python3 -m procurement_search.webapp
 API, которым пользуется страница, можно дёргать и напрямую (например, из
 другого внутреннего инструмента байеров).
 
-**Тот же сетевой нюанс, что и у CLI**: если pulscen.ru/optlist.ru
-недоступны или селекторы не откалиброваны, поиск в GUI вернёт 0 компаний,
-но не упадёт — увидите пустую таблицу и предупреждение в консоли сервера.
+**Тот же сетевой нюанс, что и у CLI**: если ни один из платных источников
+(Google CSE/Yandex Search/Yandex gen-search) не настроен или недоступен из
+этой сети, поиск в GUI вернёт 0 компаний, но не упадёт — увидите пустую
+таблицу и предупреждение в консоли сервера.
 
 ## Тесты
 
@@ -197,85 +237,39 @@ API, которым пользуется страница, можно дёрга
 pytest -q
 ```
 
-Все 50 тестов работают без сети — источники в тестах либо синтетический
-HTML (`tests/test_sources_base.py`, `tests/test_duckduckgo_source.py`),
-либо замоканы (`tests/test_pipeline.py`, `tests/test_webapp.py`); оба
-LLM-провайдера (`tests/test_llm_fallback.py`), Dadata suggest API
-(`tests/test_dadata_enricher.py`) и проверка живости сайта
-(`tests/test_verify_contacts.py`) — тоже замоканы.
-
-## Калибровка селекторов pulscen.ru / optlist.ru
-
-Перед боевым использованием источников:
-
-1. Откройте `https://www.pulscen.ru/search?query=гальванические+покрытия` в
-   браузере.
-2. DevTools (F12 или Cmd+Opt+I) → вкладка Elements.
-3. Наведите на одну карточку компании в выдаче → "Inspect".
-4. Найдите повторяющийся контейнер карточки (родительский `div`/`article`,
-   который повторяется для каждого результата) → правой кнопкой на нём в
-   DevTools → Copy → Copy selector, либо вручную определите класс.
-   Впишите в `config/sources.yaml` → `pulscen.selectors.item_selector`.
-5. Внутри одной такой карточки найдите: ссылку с названием компании
-   (`name_selector`/`link_selector`), блок телефона (`phone_selector`),
-   адрес (`address_selector`), описание/номенклатуру
-   (`description_selector`). Если есть отдельная исходящая ссылка на сайт
-   компании — впишите в `website_selector` (важно для дедупа по домену, см.
-   `src/procurement_search/models.py`, комментарий у поля `Candidate.website`).
-6. **Проверьте, показывается ли телефон сразу в HTML или только после клика
-   / AJAX-запроса.** Откройте DevTools → Network → Disable JavaScript (или
-   "View Page Source" вместо Inspect) и посмотрите, есть ли номер в сыром
-   HTML. Если нет — CSS-селектор работать не будет, потребуется
-   headless-браузер (Playwright), это уже не 10 минут калибровки, а
-   отдельная задача (design_doc §11).
-7. Повторите шаги 1–6 для `optlist.ru`.
-8. Проверьте вручную:
-
-   ```bash
-   PYTHONPATH=src python3 -c "
-   from procurement_search.config import load_sources_config
-   from procurement_search.sources.pulscen import build_default
-   s = build_default(load_sources_config())
-   for c in s.search('гальванические покрытия'):
-       print(c.name_raw, '|', c.phone_raw, '|', c.address_raw)
-   "
-   ```
-
-   Если список пуст — либо `item_selector` не совпадает с реальной вёрсткой,
-   либо сайт отдал не тот HTML, что вы видели в браузере (антибот, geo,
-   персонализация выдачи) — сравните `resp.text` с исходником страницы.
-
-Перед реальным использованием проверьте `robots.txt` обоих сайтов и
-убедитесь, что `request_delay_seconds` в конфиге достаточно консервативен —
-парсер по умолчанию соблюдает `robots.txt` (`respect_robots_txt: true`), но
-это не отменяет здравого смысла по нагрузке на чужой сервис.
+Все тесты работают без сети — источники в тестах замоканы
+(`tests/test_pipeline.py`, `tests/test_webapp.py`); оба LLM-провайдера,
+Dadata suggest API (`tests/test_dadata_enricher.py`) и проверка живости
+сайта (`tests/test_verify_contacts.py`) — тоже замоканы.
 
 ## Структура
 
 ```
 docs/design_doc.md              — технический дизайн-документ (архитектура, источники, риски)
-config/categories.yaml          — справочник категорий закупки (тиражируемость, design_doc §4)
-config/sources.yaml             — конфиг источников-каталогов, CSS-селекторы (ТРЕБУЮТ калибровки)
-config/scoring_weights.yaml     — веса скоринга по категориям
+config/sources.yaml             — конфиг источников (google_cse/yandex_search/yandex_gen_search)
+config/scoring_weights.yaml     — веса скоринга (профиль "default")
 src/procurement_search/
   models.py                     — Candidate / Company / FieldValue
-  query_normalizer.py           — шаг [1]: запрос -> категория/термины/ОКВЭД
-  sources/base.py               — общая логика источников: JSON-LD, CSS-fallback, robots.txt, fetch_url()
-  sources/pulscen.py            — источник pulscen.ru (обязателен по ТЗ, селекторы требуют калибровки)
-  sources/optlist.py            — источник optlist.ru (обязателен по ТЗ, селекторы требуют калибровки)
-  sources/duckduckgo.py         — общий веб-поиск (design_doc §7.1), работает без калибровки
+  query_normalizer.py           — шаг [1]: обёртка raw_query -> NormalizedQuery
+  attribute_extractor.py        — Слой 0: числовые атрибуты запроса (единицы измерения из units.yaml)
+  brand_extractor.py            — Слой 0: бренд/производитель из запроса (LLM, опционально)
+  sources/base.py               — общая HTTP-инфраструктура источников: robots.txt, fetch_url(), regex-контактов
+  sources/google_cse.py         — Google Custom Search JSON API (зарубежные источники, ТЗ п.4)
+  sources/yandex_search.py      — Yandex Search API (альтернатива для RU-рынка)
+  sources/yandex_gen_search.py  — генеративный ответ Yandex Search API (платно, опционально)
   dedup.py                      — шаг [5]: дедупликация по телефону/домену/имени
   enrichment.py                 — шаги [3]-[4]: NullEnricher (заглушка) и DadataEnricher (резолвинг в ЕГРЮЛ)
   verify_contacts.py            — контроль актуальности контактов: HTTP-проверка живости сайта
   scoring.py                    — шаг [6]: скоринг (релевантность/масштаб/надёжность)
   export.py                     — шаг [7]: экспорт в Excel с флагами достоверности
-  llm_classifier.py             — опциональный LLM-fallback нормализации запроса (Anthropic SDK, платный)
-  ollama_classifier.py          — тот же fallback через локальную Ollama (бесплатно, LLM_PROVIDER=ollama)
+  llm_schemas.py                 — общие Pydantic-схемы structured output для LLM-провайдеров
+  yandexgpt_classifier.py       — опциональные LLM-проверки (атрибуты, бренд, релевантность...) через Yandex AI Studio (боевой провайдер по умолчанию, LLM_PROVIDER=yandexgpt)
+  cloudru_classifier.py         — те же проверки через Cloud.ru Foundation Models (запасной вариант, LLM_PROVIDER=cloudru)
   pipeline.py, cli.py           — оркестрация (в т.ч. отсев ликвидированных компаний), CLI
   webapp.py                     — FastAPI-бэкенд веб-GUI (/api/search, /api/reports)
 static/index.html               — фронтенд веб-GUI (ванильный JS, без сборки)
 reports/                        — сгенерированные Excel-отчёты + история (в .gitignore)
-tests/                          — 50 тестов, без сети
+tests/                          — тесты, без сети
 ```
 
 ## Что делать дальше (по приоритету)
@@ -283,8 +277,8 @@ tests/                          — 50 тестов, без сети
 Порядок соответствует design_doc.md §11 — без этих шагов прототип не
 заменяет ручной ресерч байера, только ускоряет его первый черновик:
 
-1. Откалибровать селекторы pulscen.ru/optlist.ru (см. выше) — сейчас
-   реальные данные приходят только через DuckDuckGo.
+1. Настроить хотя бы один платный источник (Google CSE или Yandex Search
+   API, см. выше) — без ключей реальных кандидатов нет вообще.
 2. Получить бесплатный `DADATA_API_KEY` и прогнать реальный поиск — без
    него `DadataEnricher` существует в коде, но не используется (сработает
    молчаливый `NullEnricher`).
@@ -292,6 +286,4 @@ tests/                          — 50 тестов, без сети
    JayCopilot — без этого нечего сравнивать (design_doc §9).
 4. При росте объёма — оценить платный тариф Dadata или переход на
    Контур.Фокус/СПАРК (бесплатный лимит suggest API ограничен, design_doc
-   §11), и рассмотреть платный Bing/Google Custom Search вместо DuckDuckGo
-   (её пользовательское соглашение формально не разрешает автоматический
-   сбор, design_doc §12).
+   §11).

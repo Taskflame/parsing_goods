@@ -4,11 +4,26 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 from procurement_search.pipeline import run_pipeline
 
+# Путь к .env вычисляется от расположения этого файла, а не через
+# find_dotenv() по умолчанию (тот ищет по стеку вызовов/CWD — на практике
+# ненадёжно: под `python -m` из разных терминалов иногда не находит файл,
+# который лежит прямо в корне проекта). parents[2]: cli.py ->
+# procurement_search -> src -> корень репозитория.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 def main() -> None:
+    # Подхватывает .env из корня проекта (см. .env.example), если он есть —
+    # явный `export` в шелле всё равно имеет приоритет (override=False по
+    # умолчанию), .env только подставляет то, что ещё не задано.
+    load_dotenv(_PROJECT_ROOT / ".env")
+
     parser = argparse.ArgumentParser(description="Поиск поставщиков по текстовому запросу")
     parser.add_argument("--query", required=True, help="Запрос байера, напр. 'гальванические покрытия'")
     parser.add_argument("--output", default="suppliers.xlsx", help="Путь к выходному Excel-файлу")

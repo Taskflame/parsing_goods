@@ -4,6 +4,7 @@
 
 import requests
 
+from procurement_search.scoring import _tokenize as _stemmed_tokenize
 from procurement_search.site_relevance import compute_site_relevance, crawl_site_text
 
 CATALOG_HTML = """
@@ -86,7 +87,10 @@ def test_crawl_site_text_rejects_malformed_url():
 
 
 def test_compute_site_relevance_counts_token_overlap():
-    tokens = {"гальванические", "покрытия", "цинкование"}
+    # tokens — уже "как из query_tokens", т.е. стеммированные (compute_site_relevance
+    # сам стеммирует только site_text, вызывающий код отвечает за то, чтобы
+    # tokens были в том же формате — см. pipeline.py: tokens=query_tokens(...)).
+    tokens = _stemmed_tokenize("гальванические покрытия цинкование")
     assert compute_site_relevance(tokens, "мы делаем цинкование и гальванические покрытия") == 1.0
     assert compute_site_relevance(tokens, "продажа тортов и пирожных") == 0.0
 

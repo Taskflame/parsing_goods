@@ -8,15 +8,16 @@ scoring.py про Слой 1).
 самое пересечение токенов, но по реальному тексту каталога/номенклатуры:
 на порядок больше и точнее сигнала при той же простой математике.
 
-Без embeddings — осознанное решение по факту, а не заглушка от лени: pip
-в этой среде разработки не может поставить ничего с PyPI (SSL-блок сети,
-проверено), значит sentence-transformers/torch тут физически не завести и
-не протестировать. `compute_site_relevance` — честная детерминированная
-замена на пересечении токенов (та же математика, что и Слой 1, просто на
-намного большем тексте). Если код запускается вне этой песочницы и нужны
-настоящие эмбеддинги — замените тело `compute_site_relevance` на cosine
-similarity по вектору эмбеддинг-модели; сигнатура (текст -> float в [0,1])
-останется той же, остальной код не заметит подмены.
+Без embeddings — сознательное упрощение, не техническое ограничение (ранее
+здесь было утверждение про SSL-блок сети в песочнице — оказалось, что pip
+просто использовал системный сертификатный бандл Python.org, у которого
+не был инициализирован cert.pem; чинится через certifi, сеть работает).
+`compute_site_relevance` — честная детерминированная замена на пересечении
+токенов (та же математика и та же токенизация, что и Слой 1 —
+`scoring._tokenize`, включая стемминг, — просто на намного большем тексте).
+Если понадобятся настоящие эмбеддинги — замените тело `compute_site_relevance`
+на cosine similarity по вектору эмбеддинг-модели; сигнатура (текст -> float
+в [0,1]) останется той же, остальной код не заметит подмены.
 
 Применяется только к top-N кандидатам ПОСЛЕ грубого скоринга по Слою 1
 (см. pipeline.py) — краулинг сайта каждого кандидата стоит времени и
@@ -26,12 +27,12 @@ HTTP-запросов, тратить это на все 100-200 кандида�
 from __future__ import annotations
 
 import logging
-import re
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
+from procurement_search.scoring import _tokenize
 from procurement_search.sources.base import fetch_url
 
 logger = logging.getLogger(__name__)
@@ -53,18 +54,11 @@ _CANDIDATE_PATHS = [
     "/contacts",
 ]
 
-# См. scoring.py::_TOKEN_RE — тот же порядок альтернатив и та же причина:
-# дробное число раньше отдельных цифр, иначе "2,5" -> "2", "5".
-_TOKEN_RE = re.compile(r"[а-яa-zё]+|\d+[.,]\d+|\d+", re.IGNORECASE)
 _DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 _MAX_TEXT_CHARS = 20000
-
-
-def _tokenize(text: str) -> set[str]:
-    return {t.lower().replace(",", ".") for t in _TOKEN_RE.findall(text)}
 
 
 def _extract_visible_text(html: str) -> str:

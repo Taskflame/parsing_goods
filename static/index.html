@@ -18,6 +18,8 @@
     --unverified-text: #92400e;
     --stale: #fee2e2;
     --stale-text: #991b1b;
+    --not-checked: #e5e7eb;
+    --not-checked-text: #374151;
   }
   * { box-sizing: border-box; }
   body {
@@ -101,6 +103,7 @@
   .badge.confirmed { background: var(--confirmed); color: var(--confirmed-text); }
   .badge.unverified { background: var(--unverified); color: var(--unverified-text); }
   .badge.stale { background: var(--stale); color: var(--stale-text); }
+  .badge.not-checked { background: var(--not-checked); color: var(--not-checked-text); }
   .muted { color: var(--muted); }
   .score-total { font-weight: 700; }
   .table-wrap { overflow-x: auto; }
@@ -113,7 +116,7 @@
 <body>
 <header>
   <h1>Поиск поставщиков — прототип ИИ в закупках</h1>
-  <p>Пайплайн: нормализация запроса → pulscen.ru / optlist.ru → дедуп → скоринг → отчёт</p>
+  <p>Пайплайн: Слой 0 (атрибуты/бренд) → поиск (Google CSE / Yandex Search) → дедуп → скоринг → отчёт</p>
 </header>
 
 <main>
@@ -121,9 +124,9 @@
     <h2>Новый поиск</h2>
     <form class="search-form" id="search-form">
       <input type="text" id="query" placeholder="Например: гальванические покрытия" required>
-      <label><input type="checkbox" id="use-llm"> LLM-fallback категории (нужен ANTHROPIC_API_KEY/Ollama)</label>
+      <label><input type="checkbox" id="use-llm"> LLM-fallback: категория, опечатки в единицах измерения, бренд в поиске (нужен LLM_PROVIDER: yandexgpt/cloudru)</label>
       <label><input type="checkbox" id="deep-relevance"> Слой 2: краулить сайты кандидатов (медленнее, точнее)</label>
-      <label><input type="checkbox" id="relevance-llm-check"> Слой 3: LLM-проверка релевантности (нужен deep_relevance)</label>
+      <label><input type="checkbox" id="relevance-llm-check"> LLM-фильтр: статьи/видео сразу; соответствие товара, характеристик и наличие товара — вместе со Слоем 2</label>
       <button type="submit" id="submit-btn">Найти</button>
     </form>
     <div id="status"></div>
@@ -141,6 +144,7 @@
             <th>Адрес</th>
             <th>Сайт</th>
             <th>Источники</th>
+            <th>Наличие товара</th>
             <th>Relevance</th>
             <th>Trust</th>
             <th>Данные</th>
@@ -202,6 +206,16 @@ function websiteCell(field) {
   return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a><br>${badge(field.confidence)}`;
 }
 
+function stockBadge(stockStatus) {
+  const map = {
+    'в наличии': 'confirmed',
+    'нет в наличии': 'stale',
+    'не проверено': 'not-checked',
+  };
+  const cls = map[stockStatus] || 'not-checked';
+  return `<span class="badge ${cls}">${stockStatus || 'не проверено'}</span>`;
+}
+
 function renderResults(companies) {
   resultsBody.innerHTML = '';
   for (const c of companies) {
@@ -217,6 +231,7 @@ function renderResults(companies) {
       <td>${fieldCell(c.address)}</td>
       <td>${websiteCell(c.website)}</td>
       <td>${c.sources.join(', ')}</td>
+      <td>${stockBadge(c.stock_status)}</td>
       <td>${relevance}</td>
       <td>${trust}</td>
       <td>${confidence}</td>
