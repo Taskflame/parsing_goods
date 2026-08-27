@@ -42,13 +42,12 @@ pytest добавьте `src` в `PYTHONPATH`:
 
 По умолчанию выключен и не требует ни сети, ни ключа.
 
-Провайдер по умолчанию — `LLM_PROVIDER=yandexgpt`
-(`src/procurement_search/yandexgpt_classifier.py`): [Yandex AI Studio](https://yandex.cloud/ru/services/ai-studio)
+Единственный LLM-провайдер — `src/procurement_search/yandexgpt_classifier.py`:
+[Yandex AI Studio](https://yandex.cloud/ru/services/ai-studio)
 (Yandex Foundation Models), OpenAI-совместимый Chat Completions API
 (`llm.api.cloud.yandex.net/v1`) поверх моделей YandexGPT Pro/Lite.
 
 ```bash
-export LLM_PROVIDER=yandexgpt
 export YANDEX_FM_API_KEY=...   # API-ключ Yandex AI Studio (НЕ YANDEX_SEARCH_API_KEY — другой сервис)
 export YANDEX_FM_MODEL=yandexgpt   # или yandexgpt-lite
 export YANDEX_FOLDER_ID=...    # нужен, если ещё не задан для Yandex Search API выше
@@ -56,8 +55,8 @@ export YANDEX_FOLDER_ID=...    # нужен, если ещё не задан д�
 
 Авторизация — обычный статический API-ключ (Bearer) через стандартный
 `openai` SDK, `response_format: json_schema` для структурированного
-вывода — тот же контракт, что и у cloud.ru ниже. Модель адресуется не
-голым ID, а URI вида `gpt://<FOLDER_ID>/<YANDEX_FM_MODEL>/latest`,
+вывода. Модель адресуется не голым ID, а URI вида
+`gpt://<FOLDER_ID>/<YANDEX_FM_MODEL>/latest`,
 который `yandexgpt_classifier.py` собирает сам из `YANDEX_FM_MODEL` +
 folder_id. Получить ключ: [Yandex AI Studio](https://yandex.cloud/ru/services/ai-studio)
 → API-ключи → создать ключ.
@@ -74,35 +73,6 @@ Search API и AI Studio — независимые сервисы Yandex Cloud, 
 ```bash
 export YANDEX_FM_FOLDER_ID=...  # folder_id именно того аккаунта, где выпущен YANDEX_FM_API_KEY
 ```
-
-**Запасной вариант на случай отката** — `LLM_PROVIDER=cloudru`
-(`src/procurement_search/cloudru_classifier.py`):
-[Cloud.ru Evolution Foundation Models](https://cloud.ru/products/evolution-foundation-models),
-OpenAI-совместимый API поверх 20+ моделей (GLM, Qwen, DeepSeek, MiniMax,
-GigaChat), регистрация без VPN и зарубежных карт, оплата по факту
-использования.
-
-```bash
-export LLM_PROVIDER=cloudru
-export CLOUDRU_API_KEY=...     # Key Secret из API-ключа (см. ниже, откуда взять)
-export CLOUDRU_MODEL=...       # точный ID модели из каталога Cloud.ru
-```
-
-Авторизация — обычный статический API-ключ (Bearer) —
-никакого обмена на IAM-токен не требуется, несмотря на то что так
-выглядело по README пакета `evolution-openai`, который сначала
-рассматривался для этой интеграции: на практике связка `key_id`/`secret`
-через IAM (`evolution-openai`) отдала `401 Unauthorized`, а обычный
-`openai` SDK с ключом из карточки модели — сработал. Получить ключ:
-Evolution → Foundation Models → карточка нужной модели → "Использовать" →
-создать API-ключ, оттуда взять Key Secret.
-
-Регистрация без VPN и зарубежных карт — но сам API
-(`foundation-models.api.cloud.ru`) может быть недоступен, если на вашей
-машине включён VPN/прокси с выходом за пределы РФ: наблюдалось вживую —
-`SSLEOFError`/обрыв TLS-рукопожатия при активном VPN (V2Ray/Xray-клиенты
-вроде V2Box — популярный случай), нормальная работа сразу после его
-отключения.
 
 ### Резолвинг в ЕГРЮЛ через Dadata — отсев неактуальных данных (опционально)
 
@@ -262,9 +232,8 @@ src/procurement_search/
   verify_contacts.py            — контроль актуальности контактов: HTTP-проверка живости сайта
   scoring.py                    — шаг [6]: скоринг (релевантность/масштаб/надёжность)
   export.py                     — шаг [7]: экспорт в Excel с флагами достоверности
-  llm_schemas.py                 — общие Pydantic-схемы structured output для LLM-провайдеров
-  yandexgpt_classifier.py       — опциональные LLM-проверки (атрибуты, бренд, релевантность...) через Yandex AI Studio (боевой провайдер по умолчанию, LLM_PROVIDER=yandexgpt)
-  cloudru_classifier.py         — те же проверки через Cloud.ru Foundation Models (запасной вариант, LLM_PROVIDER=cloudru)
+  llm_schemas.py                 — общие Pydantic-схемы structured output для LLM-провайдера
+  yandexgpt_classifier.py       — опциональные LLM-проверки (атрибуты, бренд, релевантность...) через Yandex AI Studio
   pipeline.py, cli.py           — оркестрация (в т.ч. отсев ликвидированных компаний), CLI
   webapp.py                     — FastAPI-бэкенд веб-GUI (/api/search, /api/reports)
 static/index.html               — фронтенд веб-GUI (ванильный JS, без сборки)

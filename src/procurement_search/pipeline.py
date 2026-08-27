@@ -16,6 +16,7 @@ from pathlib import Path
 from procurement_search.attribute_extractor import extract_attributes
 from procurement_search.brand_extractor import extract_brand
 from procurement_search.config import (
+    load_categories,
     load_marketplace_domains,
     load_scoring_weights,
     load_sources_config,
@@ -35,24 +36,38 @@ from procurement_search.models import (
 from procurement_search.query_normalizer import normalize_query
 from procurement_search.relevance_llm import (
     check_attribute_match,
+    classify_category,
     classify_listing_type,
     classify_relevance,
     classify_stock_status,
     extract_contacts,
+    extract_legal_name,
+    extract_price,
 )
 from procurement_search.scoring import (
     combine_score,
+    company_domain,
+    compute_confidence,
     compute_score,
+    compute_trust,
     has_attribute_mismatch,
     is_marketplace_domain,
     query_tokens,
     weights_for_category,
 )
 from procurement_search.site_relevance import compute_site_relevance, crawl_site_text
-from procurement_search.sources.base import ADDRESS_RE, EMAIL_RE, PHONE_RE, first_match
+from procurement_search.sources.base import (
+    ADDRESS_RE,
+    EMAIL_RE,
+    LEGAL_ENTITY_RE,
+    PHONE_RE,
+    PRICE_RE,
+    first_match,
+)
 from procurement_search.sources.google_cse import build_default as build_google_cse
 from procurement_search.sources.yandex_gen_search import build_default as build_yandex_gen_search
 from procurement_search.sources.yandex_search import build_default as build_yandex_search
+from procurement_search.trusted_suppliers import TrustedSupplierStore
 from procurement_search.verify_contacts import check_website_liveness
 
 logger = logging.getLogger(__name__)
@@ -69,6 +84,30 @@ logger = logging.getLogger(__name__)
 # компанию мёртвой.
 DEAD_COMPANY_STATUSES = {"ликвидирована"}
 
+# Слой 0 (доп.): поиск по базе доверенных поставщиков (trusted_suppliers.py) —
+# сколько доменов одной категории пробовать за раз. Верхняя граница — не
+# заваливать источники запросами, если доменов в базе для категории
+# накопилось много (каждый домен — отдельный запрос на источник, см.
+# _search_trusted_suppliers, а не один OR-запрос: синтаксис OR у Google
+# CSE ("OR") и Yandex Search API ("|") разный, отдельный запрос на домен
+# работает одинаково у обоих без специального разбора по источнику).
+_MAX_TRUSTED_DOMAINS_TO_QUERY = 8
+
+# Минимум уникальных компаний (после дедупа) от доверенных поставщиков,
+# при котором глобальный поиск НЕ подключается вовсе — компромисс между
+# "не тратить лишнюю квоту, когда категория уже прогрета" и "не обеднять
+# выдачу, если доверенных пока мало". Эвристика, не измеренное значение —
+# менять по мере накопления реальных данных.
+_MIN_TRUSTED_CANDIDATES_TO_SKIP_GLOBAL_SEARCH = 3
+
+# Сколько лучших (уже отсортированных) компаний финальной выдачи писать
+# обратно в базу доверенных поставщиков за один поиск — top-N, а не
+# top-1: тем же запросом уже подняты все данные, лишнего похода никуда
+# не стоит, а глубина 3 позже позволит проверить, действительно ли топ-1
+# был лучшим выбором, или байер регулярно выбирал второй/третий вариант —
+# то, что топ-1 не даёт узнать в принципе (см. trusted_suppliers.py).
+_TRUSTED_SUPPLIERS_WRITE_BACK_TOP_N = 3
+
 # Ключи, при которых Слой 3 (LLM) снижает relevance, а не обнуляет её —
 # один неверный вердикт модели не должен полностью убить кандидата,
 # которого Слои 1-2 честно нашли по реальному тексту сайта.
@@ -82,19 +121,67 @@ _LLM_NEGATIVE_RELEVANCE_MULTIPLIER = 0.3
 _ATTRIBUTE_MISMATCH_RELEVANCE_MULTIPLIER = 0.3
 
 
-def _ranking_key(company: Company, marketplace_domains: list[str]) -> tuple[bool, float]:
-    """Двухуровневая сортировка (по возрастанию): сначала не-маркетплейсы,
-    внутри каждой группы — по убыванию score.total (см. is_marketplace_domain
-    в scoring.py про мотивацию). Маркетплейсы не выкидываются из выдачи, а
-    гарантированно оказываются НИЖЕ любого не-маркетплейса независимо от их
-    score — всплывают в видимом топе только когда конкурентов не хватает,
-    а не когда у них случайно высокий score.
+def _parse_price_value(raw: str) -> float | None:
+    """Число из строки цены (regex-матч PRICE_RE вида '15 000,50 ₽' или
+    произвольный ответ LLM, см. extract_price) — только для сортировки в
+    _ranking_key, отображается всё равно исходная строка (Company.price.value).
+
+    Отбрасывает всё, кроме цифр/`.`/`,`, дальше решает, что запятая значит:
+    десятичный разделитель (1-2 цифры после последней запятой — "1500,50")
+    или разделитель тысяч, как пробел (иначе — "12,500" без копеек).
+    Невалидное/нулевое значение -> None, а не 0.0 (0.0 в _ranking_key —
+    легитимное место "самой дешёвой находки", 0 руб же ничего не значит и
+    не должен обгонять реальные цены)."""
+    cleaned = re.sub(r"[^\d.,]", "", raw)
+    if not cleaned:
+        return None
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "," in cleaned:
+        decimals = len(cleaned) - cleaned.rindex(",") - 1
+        cleaned = cleaned.replace(",", ".") if decimals <= 2 else cleaned.replace(",", "")
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _ranking_key(company: Company, marketplace_domains: list[str]) -> tuple[bool, bool, float, float]:
+    """Трёхуровневая сортировка (по возрастанию):
+      1. сначала не-маркетплейсы, потом маркетплейсы (см. is_marketplace_domain
+         в scoring.py) — маркетплейсы не выкидываются из выдачи, а
+         гарантированно оказываются НИЖЕ любого не-маркетплейса независимо
+         от их score, всплывают в видимом топе только когда конкурентов не
+         хватает;
+      2. внутри каждой группы — сначала компании с НАЙДЕННОЙ ценой
+         (Company.price, см. pipeline._attach_site_price), по возрастанию
+         цены: жёсткая сортировка "дешевле — выше", которую байер явно
+         запросил как отдельный KPI поверх уже готового списка (design-
+         обсуждение), а не ещё один вес внутри compute_score — цена может
+         полностью перевесить более высокий score. Компании БЕЗ найденной
+         цены в эту сортировку не участвуют и не штрафуются (тот же принцип
+         "нет данных — не штраф", что и везде в scoring.py) — они просто
+         идут отдельным блоком после всех отсортированных по цене;
+      3. внутри одинаковой цены (или внутри блока "цена неизвестна") — по
+         убыванию score.total, как раньше.
+
+    Цена в норме появляется только после Слоя 2 (_refine_relevance крадёт
+    её из уже скачанного текста сайта, см. _attach_site_price) — то есть
+    практически действует только при deep_relevance=True; без него у всех
+    компаний price=None, и сортировка ведёт себя ровно как раньше.
 
     Применяется ДО среза `alive_companies[:deep_relevance_top_n]` в
     search_and_score — значит и бюджет краулинга Слоя 2/3 не тратится на
     маркетплейсы, пока есть чем его заполнить без них."""
     score = company.score.total if company.score else 0.0
-    return (is_marketplace_domain(company, marketplace_domains), -score)
+    price_value = _parse_price_value(company.price.value) if company.price else None
+    return (
+        is_marketplace_domain(company, marketplace_domains),
+        price_value is None,
+        price_value if price_value is not None else 0.0,
+        -score,
+    )
 
 
 def _is_knockout(company: Company) -> bool:
@@ -160,12 +247,37 @@ def _filter_non_listings(companies: list[Company], raw_query: str) -> list[Compa
 
 def _default_enricher() -> Enricher:
     """DadataEnricher, если задан DADATA_API_KEY, иначе честная заглушка
-    NullEnricher. Тот же паттерн, что у LLM_PROVIDER/YANDEX_FM_API_KEY —
-    фича включается наличием переменной окружения, без правки кода."""
+    NullEnricher. Тот же паттерн, что у YANDEX_FM_API_KEY — фича
+    включается наличием переменной окружения, без правки кода."""
     api_key = os.environ.get("DADATA_API_KEY")
     if api_key:
         return DadataEnricher(api_key=api_key)
     return NullEnricher()
+
+
+def _search_trusted_suppliers(
+    sources: list, trusted_domains: list[str], clean_query_text: str
+) -> list[Candidate]:
+    """Поиск, ограниченный уже известными доменами категории (см.
+    search_and_score, use_trusted_suppliers) — один запрос НА ДОМЕН, а не
+    один OR-запрос сразу на все домены: у Google CSE оператор OR — слово
+    "OR", у Yandex Search API — "|" (см. sources/yandex_search.py),
+    отдельный запрос на домен работает одинаково у обоих источников без
+    специального разбора синтаксиса по каждому.
+
+    `site:` — стандартный оператор ограничения по домену, поддержан и
+    Google CSE, и Yandex Search API. clean_query_text (не raw_query) —
+    то же "название товара без чисел/единиц измерения", что и у обычных
+    search_terms (см. extract_attributes) — короче и без шума."""
+    found: list[Candidate] = []
+    for source in sources:
+        for domain in trusted_domains:
+            candidates = source.search(f"site:{domain} {clean_query_text}")
+            logger.info(
+                "%s: %d кандидатов по доверенному домену %r", source.name, len(candidates), domain
+            )
+            found.extend(candidates)
+    return found
 
 
 def search_and_score(
@@ -176,6 +288,7 @@ def search_and_score(
     deep_relevance: bool = False,
     relevance_llm_check: bool = False,
     deep_relevance_top_n: int = 20,
+    use_trusted_suppliers: bool = False,
 ) -> list[Company]:
     """Шаги [1]-[6]: нормализация -> кандидаты -> дедуп -> обогащение ->
     knockout -> скоринг -> (опционально) уточнение релевантности.
@@ -195,7 +308,11 @@ def search_and_score(
     deep_relevance=False по умолчанию: Слой 2 (краулинг сайта top-N
     кандидатов + пересчёт relevance по реальному тексту, см.
     site_relevance.py) — не бесплатно по времени (HTTP-запросы на каждого
-    из `deep_relevance_top_n` кандидатов), поэтому опционально.
+    из `deep_relevance_top_n` кандидатов), поэтому опционально. Заодно
+    единственный источник Company.price (см. _attach_site_price) — цена
+    почти никогда не видна в сниппете поисковой выдачи, только на самой
+    странице товара, поэтому жёсткая сортировка по цене в _ranking_key
+    (см. её докстринг) практически действует только при deep_relevance=True.
 
     Слой 0.5 (scoring.has_attribute_mismatch) работает всегда, без флагов:
     числовые атрибуты запроса ("10000 л/час") извлекаются
@@ -207,7 +324,7 @@ def search_and_score(
     грубее и работает на всей выдаче, а не только top-N.
 
     relevance_llm_check=False по умолчанию: требует переменных окружения
-    выбранного провайдера LLM_PROVIDER (yandexgpt/cloudru). Включает два
+    Yandex AI Studio (YANDEX_FM_API_KEY/YANDEX_FM_MODEL). Включает два
     независимых LLM-фильтра:
       - _filter_non_listings (по сниппету, без краулинга) — исключает
         статьи/видео/обзоры, прошедшие Слой 1 по токенам, но не
@@ -221,6 +338,24 @@ def search_and_score(
         результат в company.stock_status (models.StockStatus). В отличие от
         двух пунктов выше — НЕ влияет на score/ранжирование, это только
         информационная плашка для байера (см. export.py/webapp.py).
+
+    use_trusted_suppliers=False по умолчанию: требует LLM (та же
+    инфраструктура, что use_llm_fallback, но отдельный флаг — этот пишет
+    в персистентную базу, use_llm_fallback ничего не сохраняет, смешивать
+    их в одном флаге запутало бы, что именно включается). При включении:
+      1. Слой 0 (доп.) — classify_category определяет категорию запроса
+         (config/categories.yaml) одним LLM-вызовом;
+      2. если категория нашлась и в trusted_suppliers.py есть под неё
+         домены — сначала пробуем поиск, ограниченный ЭТИМИ доменами
+         (_search_trusted_suppliers), и только если кандидатов после
+         дедупа набралось меньше _MIN_TRUSTED_CANDIDATES_TO_SKIP_GLOBAL_SEARCH —
+         подключаем сегодняшний неограниченный поиск (design-обсуждение:
+         байер явно попросил именно такой порядок, а не "и то, и то
+         сразу" — экономия квоты платных API на уже "прогретых"
+         категориях);
+      3. после скоринга top-N финальной выдачи (не top-1 — см.
+         _TRUSTED_SUPPLIERS_WRITE_BACK_TOP_N) пишутся обратно в базу под
+         резолвленной категорией — так база растёт с каждым поиском.
     """
     enricher = enricher or _default_enricher()
 
@@ -297,28 +432,83 @@ def search_and_score(
             "Yandex gen-search включён (YANDEX_GEN_SEARCH_ENABLED=true) — платно, "
             "заметно дороже классического yandex_search, см. sources/yandex_gen_search.py"
         )
-    # Дополнительные поисковые термины, сразу после raw_query. Раньше во
-    # внешние источники уходил ТОЛЬКО raw_query целиком, и длинный запрос
-    # со всеми характеристиками топит бренд/название в собственном
-    # ранжировании источника не хуже, чем топил его наш Layer 1 (design-
-    # обсуждение: конкретный кейс, где бренд не находился на первых
-    # позициях выдачи именно из-за длины и зашумлённости запроса).
-    #   1. brand_first_term (если бренд распознан) — короткий запрос с
-    #      брендом ПЕРВЫМ словом, а не там, где его написал байер.
-    #   2. clean_query_text — короткий запрос "название товара" без чисел/
-    #      единиц измерения вообще (с брендом на исходном месте).
-    extra_terms = [clean_query_text]
-    if brand:
-        without_brand = re.sub(re.escape(brand), "", clean_query_text, flags=re.IGNORECASE)
-        without_brand = re.sub(r"\s+", " ", without_brand).strip()
-        brand_first_term = f"{brand} {without_brand}".strip() if without_brand else brand
-        extra_terms.insert(0, brand_first_term)
-    search_terms = list(dict.fromkeys([normalized.raw_query, *extra_terms]))
-    for source in sources:
-        for term in search_terms[:3]:  # raw_query + бренд-термин + clean_text, не больше
-            found = source.search(term)
-            logger.info("%s: %d кандидатов по запросу '%s'", source.name, len(found), term)
-            candidates.extend(found)
+    # Слой 0 (доп.): категория запроса — только ключ для базы доверенных
+    # поставщиков (design-обсуждение отличает это от прежнего, выпиленного
+    # categories.yaml, см. docs/design_doc.md §4: здесь у категории есть
+    # реальный потребитель, а не dead code). category_code остаётся None,
+    # если флаг выключен, LLM недоступна, или сама модель не нашла
+    # подходящей категории — во всех случаях просто работаем как раньше.
+    category_code: str | None = None
+    used_trusted_suppliers = False
+    if use_trusted_suppliers:
+        categories_cfg = load_categories()
+        category_code = classify_category(normalized.raw_query, categories_cfg)
+        if category_code is None:
+            logger.info(
+                "Запрос %r не отнесён ни к одной категории (LLM недоступна или "
+                "не нашла подходящей) — доверенные поставщики не подключаются",
+                normalized.raw_query,
+            )
+        else:
+            category_name = categories_cfg.get(category_code, {}).get("name", category_code)
+            logger.info("Запрос %r отнесён к категории %s (%r)", normalized.raw_query, category_code, category_name)
+            with TrustedSupplierStore() as store:
+                trusted_domains = store.domains_for_category(category_code)[:_MAX_TRUSTED_DOMAINS_TO_QUERY]
+            if not trusted_domains:
+                logger.info(
+                    "Категория %r: доверенных доменов в базе ещё нет — сразу "
+                    "обычный глобальный поиск (база начнёт заполняться по итогам этого запроса)",
+                    category_code,
+                )
+            else:
+                trusted_candidates = _search_trusted_suppliers(sources, trusted_domains, clean_query_text)
+                # Кандидаты добавляются в общий пул независимо от исхода
+                # ниже — уже сделанная работа не выбрасывается, даже если
+                # доверенных оказалось недостаточно и подключается
+                # глобальный поиск (он ДОПОЛНЯЕТ эти кандидаты, а не
+                # заменяет их).
+                candidates.extend(trusted_candidates)
+                trusted_groups = dedup_candidates(trusted_candidates)
+                if len(trusted_groups) >= _MIN_TRUSTED_CANDIDATES_TO_SKIP_GLOBAL_SEARCH:
+                    logger.info(
+                        "Категория %r: %d доверенных кандидатов после дедупа — "
+                        "глобальный поиск пропущен",
+                        category_code,
+                        len(trusted_groups),
+                    )
+                    used_trusted_suppliers = True
+                else:
+                    logger.info(
+                        "Категория %r: доверенных кандидатов недостаточно (%d < %d) — "
+                        "подключаем обычный глобальный поиск",
+                        category_code,
+                        len(trusted_groups),
+                        _MIN_TRUSTED_CANDIDATES_TO_SKIP_GLOBAL_SEARCH,
+                    )
+
+    if not used_trusted_suppliers:
+        # Дополнительные поисковые термины, сразу после raw_query. Раньше во
+        # внешние источники уходил ТОЛЬКО raw_query целиком, и длинный запрос
+        # со всеми характеристиками топит бренд/название в собственном
+        # ранжировании источника не хуже, чем топил его наш Layer 1 (design-
+        # обсуждение: конкретный кейс, где бренд не находился на первых
+        # позициях выдачи именно из-за длины и зашумлённости запроса).
+        #   1. brand_first_term (если бренд распознан) — короткий запрос с
+        #      брендом ПЕРВЫМ словом, а не там, где его написал байер.
+        #   2. clean_query_text — короткий запрос "название товара" без чисел/
+        #      единиц измерения вообще (с брендом на исходном месте).
+        extra_terms = [clean_query_text]
+        if brand:
+            without_brand = re.sub(re.escape(brand), "", clean_query_text, flags=re.IGNORECASE)
+            without_brand = re.sub(r"\s+", " ", without_brand).strip()
+            brand_first_term = f"{brand} {without_brand}".strip() if without_brand else brand
+            extra_terms.insert(0, brand_first_term)
+        search_terms = list(dict.fromkeys([normalized.raw_query, *extra_terms]))
+        for source in sources:
+            for term in search_terms[:3]:  # raw_query + бренд-термин + clean_text, не больше
+                found = source.search(term)
+                logger.info("%s: %d кандидатов по запросу '%s'", source.name, len(found), term)
+                candidates.extend(found)
 
     if not candidates:
         logger.warning(
@@ -386,8 +576,36 @@ def search_and_score(
             tokens=query_tokens(normalized, clean_query_text=clean_query_text),
             weights=weights_for_query,
             use_llm=relevance_llm_check,
+            enricher=enricher,
         )
+        # Слой 2 мог дорезолвить компанию в ЕГРЮЛ по названию юрлица со
+        # своего же сайта (см. _attach_legal_name) и обнаружить, что она
+        # на самом деле ликвидирована — а не просто "неизвестно", как
+        # выглядело при первой попытке по заголовку товарной карточки
+        # (enrichment.py). Ту же knockout-отсечку, что и раньше (ТЗ п.4),
+        # нужно применить и здесь, иначе такая компания проскочит в выдачу
+        # только потому, что попала в неё ДО того, как реально резолвилась.
+        before_knockout = len(alive_companies)
+        alive_companies = [c for c in alive_companies if not _is_knockout(c)]
+        if len(alive_companies) != before_knockout:
+            logger.info(
+                "Исключено %d компаний после Слоя 2 — дорезолвились в ЕГРЮЛ как "
+                "ликвидированные (первая попытка резолвинга по заголовку карточки "
+                "товара их не находила, см. _attach_legal_name)",
+                before_knockout - len(alive_companies),
+            )
         alive_companies.sort(key=lambda c: _ranking_key(c, marketplace_domains))
+
+    if use_trusted_suppliers and category_code is not None:
+        with TrustedSupplierStore() as store:
+            _write_back_trusted_suppliers(
+                store,
+                alive_companies,
+                category_code,
+                normalized.raw_query,
+                marketplace_domains,
+                _TRUSTED_SUPPLIERS_WRITE_BACK_TOP_N,
+            )
 
     return alive_companies
 
@@ -398,6 +616,7 @@ def _refine_relevance(
     tokens: set[str],
     weights: dict,
     use_llm: bool,
+    enricher: Enricher,
 ) -> None:
     """Слои 2-3 уточнения релевантности (design-обсуждение скоринга) — на
     входе уже отранжированный по грубому Слою-1-скору срез top-N, не вся
@@ -426,6 +645,8 @@ def _refine_relevance(
             continue
 
         _attach_site_contacts(company, site_text, use_llm=use_llm)
+        _attach_site_price(company, site_text, use_llm=use_llm)
+        _attach_legal_name(company, site_text, enricher, use_llm=use_llm)
 
         relevance = compute_site_relevance(tokens, site_text)
 
@@ -460,11 +681,15 @@ def _refine_relevance(
             # None (LLM недоступна/упала) — stock_status остаётся
             # NOT_CHECKED, не выдумываем результат.
 
-        # company.score всегда заполнен на этом шаге — _refine_relevance
-        # вызывается только после того, как compute_score прошёл по всем
-        # alive_companies (см. search_and_score).
-        trust = company.score.trust
-        confidence = company.score.confidence
+        # trust/confidence пересчитываются заново, не берутся из старого
+        # company.score — _attach_legal_name выше мог только что дорезолвить
+        # компанию в ЕГРЮЛ (inn/status/адрес поменялись), и trust/confidence
+        # Слоя 1, посчитанные ДО этого по "неизвестно"/inn=None, устарели
+        # бы и разошлись с company.status/company.inn на экране (design-
+        # обсуждение: цена этого пересчёта пренебрежимо мала — это чистая
+        # функция от уже готовых полей Company, без сети).
+        trust = compute_trust(company, weights)
+        confidence = compute_confidence(company)
         total = combine_score(relevance, trust, confidence, weights)
         company.score = ScoreBreakdown(
             relevance=relevance, trust=trust, confidence=confidence, total=total
@@ -547,6 +772,143 @@ def _attach_site_contacts(company: Company, site_text: str, use_llm: bool = Fals
             )
 
 
+def _attach_site_price(company: Company, site_text: str, use_llm: bool = False) -> None:
+    """Слой 2 (доп.): цена товара с сайта кандидата — переиспользует уже
+    скачанный текст сайта (та же логика, что у _attach_site_contacts, но
+    цена не contacts-словарь с несколькими источниками, а единственное
+    поле Company.price, см. models.py: второго источника цены, кроме
+    самого сайта, у нас нет).
+
+    Порядок ОБРАТНЫЙ по сравнению с _attach_site_contacts (там сначала
+    regex — точное совпадение надёжнее догадки): при `use_llm=True`
+    сначала спрашиваем LLM (relevance_llm.extract_price), и только если
+    она ничего не вернула (недоступна/упала, или на странице правда нет
+    цены) — пробуем PRICE_RE как последний шанс. Причина именно для цены:
+    даже на верной странице товара (см. site_relevance.crawl_site_text
+    про баг с потерянным путём ссылки) рядом часто соседствуют НЕСКОЛЬКО
+    чисел с валютой — старая зачёркнутая цена по акции, блок "похожие
+    товары"/"с этим покупают", стоимость доставки — а PRICE_RE не понимает
+    контекст и берёт первое совпадение по странице, не обязательно то, что
+    относится к запрошенному товару (design-обсуждение: реально
+    наблюдалось на живой выдаче — вместо 48 219 ₽ регекс находил "100 ₽"
+    из совсем другого места страницы). LLM видит текст целиком и может
+    отличить нужную цену от соседних чисел.
+
+    UNVERIFIED, как и остальные поля со скрапинга — цена меняется быстрее,
+    чем следующий перезапуск поиска, независимая проверка не предусмотрена.
+
+    Оба пути (LLM и regex) дополнительно проверяются через
+    _parse_price_value: "0 руб."/"0 640 ₽" реально встречаются на живой
+    выдаче (design-обсуждение) — не опечатка модели и не брак regex, а
+    похоже на плейсхолдер JS-виджета динамической цены ("0" до того, как
+    скрипт на странице подставит настоящее значение), который остаётся в
+    HTML как есть, потому что наш краулер не исполняет JavaScript (см.
+    site_relevance.crawl_site_text — тот же класс ограничения, что и у
+    DuckDuckGo-антибота). Ноль/нечитаемое значение — не более достоверная
+    цена, чем её отсутствие, поэтому такой матч отбрасывается целиком,
+    а не сохраняется как есть."""
+    match = None
+    source = None
+    if use_llm:
+        candidate = extract_price(site_text)
+        if candidate and _parse_price_value(candidate) is not None:
+            match, source = candidate, "текст сайта (Слой 2, LLM)"
+    if not match:
+        candidate = first_match(PRICE_RE, site_text)
+        if candidate and _parse_price_value(candidate) is not None:
+            match, source = candidate, "текст сайта (Слой 2)"
+    if not match:
+        return
+    company.price = FieldValue(match, source, date.today(), VerificationFlag.UNVERIFIED)
+
+
+def _attach_legal_name(
+    company: Company, site_text: str, enricher: Enricher, use_llm: bool = False
+) -> None:
+    """Слой 2 (доп.): повторная попытка резолвинга компании в ЕГРЮЛ — см.
+    Enricher.re_resolve (enrichment.py). Первая попытка (enricher.build_company,
+    вызывается ДО краулинга) резолвит по Candidate.name_raw — для активных
+    источников (google_cse.py/yandex_search.py) это заголовок ТОВАРНОЙ
+    карточки из поисковой выдачи ("Генератор бензиновый Huter DY3000L"), а
+    не название организации, и Dadata suggest/party по такому запросу
+    почти никогда не находит матч (design-обсуждение, реальный кейс с
+    живой выдачи: у всех компаний в отчёте status="неизвестно"). Здесь
+    ищем настоящее название юрлица на самом сайте кандидата (обычно в
+    футере/разделе "Реквизиты" — LEGAL_ENTITY_RE в sources/base.py, с
+    LLM-фоллбеком при use_llm=True, как у _attach_site_price) и просим
+    enricher попробовать снова, уже с ним.
+
+    Ничего не делает, если компания уже резолвлена (company.inn задан —
+    нет смысла тратить regex/LLM на название, которое всё равно никуда не
+    пойдёт) или enricher — NullEnricher (нечему резолвить). Проверка
+    company.inn здесь, а не только внутри enricher.re_resolve — чтобы не
+    тратить LLM-вызов впустую ещё ДО похода к Dadata, а не после.
+
+    Известное ограничение: если название юрлица со Слоя 2 всё-таки не
+    совпадает с реальным поставщиком (омонимы, дочерние компании,
+    франшиза) — _pick_best_suggestion (enrichment.py) подбирает вариант по
+    пересечению адреса, та же эвристика и те же её границы, что и у
+    первой попытки резолвинга."""
+    if company.inn is not None or isinstance(enricher, NullEnricher):
+        return
+    legal_name = first_match(LEGAL_ENTITY_RE, site_text)
+    if not legal_name and use_llm:
+        legal_name = extract_legal_name(site_text)
+    if not legal_name:
+        return
+    enricher.re_resolve(company, legal_name, company.raw_candidates)
+
+
+def _first_contact_value(company: Company, field_name: str) -> str | None:
+    values = company.contacts.get(field_name, [])
+    return values[0].value if values else None
+
+
+def _write_back_trusted_suppliers(
+    store: TrustedSupplierStore,
+    companies: list[Company],
+    category_code: str,
+    raw_query: str,
+    marketplace_domains: list[str],
+    top_n: int,
+) -> None:
+    """Пишет top_n лучших (уже отсортированных) компаний финальной выдачи
+    в базу доверенных поставщиков под резолвленной категорией — top_n, а
+    не top-1: см. _TRUSTED_SUPPLIERS_WRITE_BACK_TOP_N про мотивацию
+    (топ-1 не позволяет потом проверить, действительно ли байер выбирал
+    именно первый вариант).
+
+    Маркетплейсы (is_marketplace_domain) не попадают в базу — это не
+    поставщик, а розничная площадка (см. её докстринг в scoring.py).
+    Компании без резолвленного домена сайта (scoring.company_domain
+    вернула None — ни у одного кандидата в группе не было собственного
+    сайта) тоже пропускаются: домен — обязательный ключ таблицы
+    suppliers в trusted_suppliers.py, писать без него нечего. Такие
+    компании просто не считаются в top_n — следующая по списку компания
+    занимает освободившееся место, а не пропуск целиком обрывает запись."""
+    written = 0
+    for company in companies:
+        if written >= top_n:
+            break
+        if is_marketplace_domain(company, marketplace_domains):
+            continue
+        domain = company_domain(company)
+        if domain is None:
+            continue
+        store.record_supplier(
+            domain=domain,
+            name=company.name.value,
+            category_code=category_code,
+            rank=written + 1,
+            source_query=raw_query,
+            inn=company.inn,
+            phone=_first_contact_value(company, "phone"),
+            email=_first_contact_value(company, "email"),
+            address=_first_contact_value(company, "address"),
+        )
+        written += 1
+
+
 def run_pipeline(
     raw_query: str,
     output_path: str | Path,
@@ -555,6 +917,7 @@ def run_pipeline(
     verify_websites: bool = True,
     deep_relevance: bool = False,
     relevance_llm_check: bool = False,
+    use_trusted_suppliers: bool = False,
 ) -> Path:
     """Прогоняет запрос через весь пайплайн и пишет результат в Excel (CLI-сценарий)."""
     companies = search_and_score(
@@ -564,6 +927,7 @@ def run_pipeline(
         verify_websites=verify_websites,
         deep_relevance=deep_relevance,
         relevance_llm_check=relevance_llm_check,
+        use_trusted_suppliers=use_trusted_suppliers,
     )
     return export_companies_to_excel(companies, output_path)
 

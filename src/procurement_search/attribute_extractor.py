@@ -9,17 +9,16 @@
 
 Основной путь — детерминированный: словарь единиц измерения из
 config/units.yaml (данные, не код) плюс regex "число + единица рядом". LLM
-(через yandexgpt_classifier.py/cloudru_classifier.py, выбор — LLM_PROVIDER)
-подключается только как fallback для "голых" чисел, для которых рядом не нашлось
-известной единицы — и даже тогда лишь выбирает единицу из уже
-существующего словаря, не выдумывая новую. LLM-путь выключен по умолчанию
+(через yandexgpt_classifier.py) подключается только как fallback для
+"голых" чисел, для которых рядом не нашлось известной единицы — и даже
+тогда лишь выбирает единицу из уже существующего словаря, не выдумывая
+новую. LLM-путь выключен по умолчанию
 (use_llm_fallback=False).
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 
@@ -207,30 +206,23 @@ def _strip_spans(text: str, spans: list[tuple[int, int]]) -> str:
 def _try_llm_fallback(
     raw_query: str, naked_numbers: list[str], units: dict[str, list[str]]
 ) -> list[ExtractedAttribute]:
-    """Обёртка над classify_attributes_batch_with_yandexgpt/_cloudru с
-    изоляцией сбоев — см. query_normalizer._try_llm_fallback про тот же
-    приём и его мотивацию. Один batch-вызов на все naked_numbers разом,
-    а не по вызову на число — см. докстринг extract_attributes."""
-    provider = os.environ.get("LLM_PROVIDER", "yandexgpt")
+    """Обёртка над classify_attributes_batch_with_yandexgpt с изоляцией
+    сбоев — см. query_normalizer._try_llm_fallback про тот же приём и его
+    мотивацию. Один batch-вызов на все naked_numbers разом, а не по вызову
+    на число — см. докстринг extract_attributes."""
     try:
-        if provider == "cloudru":
-            from procurement_search.cloudru_classifier import (
-                classify_attributes_batch_with_cloudru as classify_fn,
-            )
-        else:
-            from procurement_search.yandexgpt_classifier import (
-                classify_attributes_batch_with_yandexgpt as classify_fn,
-            )
+        from procurement_search.yandexgpt_classifier import (
+            classify_attributes_batch_with_yandexgpt as classify_fn,
+        )
     except ImportError:
-        logger.warning("Пакет для провайдера %r не установлен — LLM-fallback пропущен", provider)
+        logger.warning("Пакет openai не установлен — LLM-fallback пропущен")
         return []
 
     try:
         guess = classify_fn(raw_query, naked_numbers, units)
     except Exception:
         logger.warning(
-            "LLM-fallback (%s) атрибутов %r в запросе %r не сработал",
-            provider,
+            "LLM-fallback атрибутов %r в запросе %r не сработал",
             naked_numbers,
             raw_query,
             exc_info=True,

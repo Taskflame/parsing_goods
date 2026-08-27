@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -33,26 +32,18 @@ def extract_brand(raw_query: str, use_llm_fallback: bool = False) -> str | None:
     if not use_llm_fallback:
         return None
 
-    provider = os.environ.get("LLM_PROVIDER", "yandexgpt")
     try:
-        if provider == "cloudru":
-            from procurement_search.cloudru_classifier import (
-                extract_brand_with_cloudru as extract_fn,
-            )
-        else:
-            from procurement_search.yandexgpt_classifier import (
-                extract_brand_with_yandexgpt as extract_fn,
-            )
+        from procurement_search.yandexgpt_classifier import (
+            extract_brand_with_yandexgpt as extract_fn,
+        )
     except ImportError:
-        logger.warning("Пакет для провайдера %r не установлен — извлечение бренда пропущено", provider)
+        logger.warning("Пакет openai не установлен — извлечение бренда пропущено")
         return None
 
     try:
         guess = extract_fn(raw_query)
     except Exception:
-        logger.warning(
-            "Извлечение бренда (%s) для запроса %r не сработало", provider, raw_query, exc_info=True
-        )
+        logger.warning("Извлечение бренда для запроса %r не сработало", raw_query, exc_info=True)
         return None
 
     return guess.brand

@@ -55,6 +55,8 @@ _COLUMNS = [
     ("Сайт: источник/дата", 26),
     ("Источники (каталоги)", 20),
     ("Наличие товара", 16),
+    ("Цена", 16),
+    ("Цена: источник/дата", 26),
     ("Score: релевантность", 12),
     ("Score: доверие", 12),
     ("Score: полнота данных", 14),
@@ -66,6 +68,15 @@ def _field_summary(field_values) -> tuple[str, str, VerificationFlag]:
     if not field_values:
         return "", "", VerificationFlag.UNVERIFIED
     fv = field_values[0]
+    return fv.value, f"{fv.source}, {fv.retrieved_at.isoformat()}", fv.confidence
+
+
+def _single_field_summary(fv) -> tuple[str, str, VerificationFlag]:
+    """Как _field_summary, но для одиночного поля (не списка) — см.
+    Company.price в models.py: у цены, в отличие от contacts, нет
+    нескольких источников на одного кандидата."""
+    if fv is None:
+        return "", "", VerificationFlag.UNVERIFIED
     return fv.value, f"{fv.source}, {fv.retrieved_at.isoformat()}", fv.confidence
 
 
@@ -96,6 +107,7 @@ def export_companies_to_excel(companies: list[Company], output_path: str | Path)
         email_val, email_src, email_flag = _field_summary(company.contacts.get("email", []))
         addr_val, addr_src, addr_flag = _field_summary(company.contacts.get("address", []))
         site_val, site_src, site_flag = _field_summary(company.contacts.get("website", []))
+        price_val, price_src, price_flag = _single_field_summary(company.price)
 
         score = company.score
         row = [
@@ -112,6 +124,8 @@ def export_companies_to_excel(companies: list[Company], output_path: str | Path)
             site_src,
             ", ".join(company.sources),
             company.stock_status.value,
+            price_val,
+            price_src,
             round(score.relevance, 3) if score else "",
             round(score.trust, 3) if score else "",
             round(score.confidence, 3) if score else "",
@@ -120,7 +134,13 @@ def export_companies_to_excel(companies: list[Company], output_path: str | Path)
         for col_idx, value in enumerate(row, start=1):
             ws.cell(row=row_idx, column=col_idx, value=value)
 
-        for col_idx, flag in ((4, phone_flag), (6, email_flag), (8, addr_flag), (10, site_flag)):
+        for col_idx, flag in (
+            (4, phone_flag),
+            (6, email_flag),
+            (8, addr_flag),
+            (10, site_flag),
+            (14, price_flag),
+        ):
             ws.cell(row=row_idx, column=col_idx).fill = _FLAG_FILL[flag]
 
         # "Наличие товара" — 13-я колонка (см. _COLUMNS): после "Источники (каталоги)".

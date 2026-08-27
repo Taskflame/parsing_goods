@@ -44,6 +44,7 @@ class SearchRequest(BaseModel):
     use_llm_fallback: bool = False
     deep_relevance: bool = False
     relevance_llm_check: bool = False
+    use_trusted_suppliers: bool = False
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
@@ -73,6 +74,19 @@ def _field_to_dict(field_values: list[FieldValue]) -> dict | None:
     }
 
 
+def _single_field_to_dict(fv: FieldValue | None) -> dict | None:
+    """Как _field_to_dict, но для одиночного поля (не списка) — см.
+    Company.price в models.py."""
+    if fv is None:
+        return None
+    return {
+        "value": fv.value,
+        "source": fv.source,
+        "date": fv.retrieved_at.isoformat(),
+        "confidence": fv.confidence.value,
+    }
+
+
 def _company_to_dict(company: Company) -> dict:
     score = company.score
     return {
@@ -85,6 +99,7 @@ def _company_to_dict(company: Company) -> dict:
         "website": _field_to_dict(company.contacts.get("website", [])),
         "sources": company.sources,
         "stock_status": company.stock_status.value,
+        "price": _single_field_to_dict(company.price),
         "score": (
             {
                 "relevance": round(score.relevance, 3),
@@ -109,6 +124,7 @@ def api_search(payload: SearchRequest) -> dict:
         use_llm_fallback=payload.use_llm_fallback,
         deep_relevance=payload.deep_relevance,
         relevance_llm_check=payload.relevance_llm_check,
+        use_trusted_suppliers=payload.use_trusted_suppliers,
     )
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -159,7 +175,7 @@ def main() -> None:
     import uvicorn
     from dotenv import load_dotenv
 
-    # Подхватывает .env из корня проекта (см. .env.example), если он есть —
+    # Подхватывает .env из корня проекта, если он есть —
     # явный `export` в шелле всё равно имеет приоритет (override=False по
     # умолчанию), .env только подставляет то, что ещё не задано. Вызывается
     # здесь, а не на уровне модуля — тесты (test_webapp.py) импортируют

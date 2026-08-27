@@ -32,3 +32,7 @@ def load_marketplace_domains() -> list[str]:
     path = CONFIG_DIR / "marketplace_domains.yaml"
     with path.open(encoding="utf-8") as f:
         return yaml.safe_load(f) or []
+
+
+def load_categories() -> dict[str, Any]:
+    return _load_yaml("categories.yaml")

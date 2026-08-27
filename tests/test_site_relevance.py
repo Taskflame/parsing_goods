@@ -82,6 +82,52 @@ def test_crawl_site_text_respects_max_pages(monkeypatch):
     assert len(session.requested_urls) <= 2
 
 
+def test_crawl_site_text_fetches_original_url_path_first():
+    """Реальный баг с живой выдачи: Candidate.website у активных источников
+    (google_cse.py/yandex_search.py) — это URL результата поиска целиком,
+    часто прямая карточка конкретного товара, а не голый домен. Раньше
+    crawl_site_text брал только "scheme://netloc" и путь терялся молча —
+    крауler шёл по общим разделам сайта (_CANDIDATE_PATHS), карточка
+    товара со специфичной информацией (например, ценой) не скачивалась
+    вообще. Путь исходной ссылки должен быть запрошен, и первым."""
+    product_html = "<html><body><h1>Генератор Huter DY8000L</h1><p>Цена: 48 219 ₽</p></body></html>"
+    session = _FakeSession(
+        "https://diptec.ru",
+        {"/product/generator-benzinovyy-huter-dy8000l": product_html, "": HOME_HTML},
+    )
+
+    text = crawl_site_text(
+        "https://diptec.ru/product/generator-benzinovyy-huter-dy8000l",
+        delay=0.0,
+        respect_robots=False,
+        session=session,
+    )
+
+    assert text is not None
+    assert "48 219" in text
+    assert session.requested_urls[0] == "https://diptec.ru/product/generator-benzinovyy-huter-dy8000l"
+
+
+def test_crawl_site_text_original_path_counts_toward_max_pages():
+    session = _FakeSession(
+        "https://big-site.example",
+        {p: f"<html><body>page {p}</body></html>" for p in [
+            "/product/123", "", "/catalog", "/catalog/", "/produkciya",
+        ]},
+    )
+    text = crawl_site_text(
+        "https://big-site.example/product/123",
+        max_pages=1,
+        delay=0.0,
+        respect_robots=False,
+        session=session,
+    )
+
+    assert text is not None
+    assert "page /product/123" in text
+    assert len(session.requested_urls) == 1
+
+
 def test_crawl_site_text_rejects_malformed_url():
     assert crawl_site_text("не url вообще") is None
 

@@ -1,14 +1,11 @@
-"""Боевой LLM-провайдер по умолчанию — Yandex AI Studio (Yandex Foundation
-Models). Единственная запасная альтернатива — cloudru_classifier.py
-(LLM_PROVIDER=cloudru, на случай отката); Anthropic/Claude и локальная
-Ollama из проекта убраны (design-обсуждение: не нужны два платных облачных
-провайдера сразу, а Ollama требовала локально запущенной модели, что не
+"""Единственный LLM-провайдер проекта — Yandex AI Studio (Yandex Foundation
+Models). Cloud.ru убран (нестабильный доступ — 403 "Project not found" на
+уровне аккаунта); Anthropic/Claude и локальная Ollama из проекта тоже убраны
+(design-обсуждение: Ollama требовала локально запущенной модели, что не
 подходит для боевого сервера).
 
-Модуль почти дословно повторяет cloudru_classifier.py — тот же контракт
-(OpenAI-совместимый API, response_format json_schema через стандартный
-`openai` SDK), меняются только эндпоинт (https://llm.api.cloud.yandex.net/v1)
-и формат имени модели.
+Контракт — OpenAI-совместимый API, response_format json_schema через
+стандартный `openai` SDK.
 
 Авторизация — статический API-ключ Yandex AI Studio (Bearer), YANDEX_FM_API_KEY
 (НЕ тот же ключ, что YANDEX_SEARCH_API_KEY у sources/yandex_search.py —
@@ -33,8 +30,11 @@ from procurement_search.llm_schemas import (
     AttributeBatchGuess,
     AttributeMatchVerdict,
     BrandGuess,
+    CategoryGuess,
     ContactGuess,
+    LegalNameGuess,
     ListingTypeVerdict,
+    PriceGuess,
     RelevanceVerdict,
     StockVerdict,
 )
@@ -42,23 +42,22 @@ from procurement_search.llm_schemas import (
 YANDEX_FM_BASE_URL = os.environ.get("YANDEX_FM_BASE_URL", "https://llm.api.cloud.yandex.net/v1")
 # ID модели из каталога Yandex AI Studio (например "yandexgpt" или
 # "yandexgpt-lite") — не полный URI, тот собирается ниже вместе с
-# YANDEX_FOLDER_ID. Обязателен явный YANDEX_FM_MODEL, как и у cloud.ru
-# (CLOUDRU_MODEL) — не зашиваем непроверенную догадку как дефолт.
+# YANDEX_FOLDER_ID. Обязателен явный YANDEX_FM_MODEL — не зашиваем
+# непроверенную догадку как дефолт.
 YANDEX_FM_MODEL = os.environ.get("YANDEX_FM_MODEL")
 
 
 def _client():
-    """Ленивый импорт + создание клиента — тот же приём, что у
-    cloudru_classifier._client(): явный импорт только тем кодом, который
-    реально включил LLM_PROVIDER=yandexgpt, хотя пакет `openai` и так в
-    requirements.txt (общая зависимость с cloud.ru)."""
+    """Ленивый импорт + создание клиента — явный импорт только тем кодом,
+    который реально дошёл до LLM-вызова, хотя пакет `openai` и так в
+    requirements.txt."""
     from openai import OpenAI
 
     api_key = os.environ.get("YANDEX_FM_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "LLM_PROVIDER=yandexgpt требует YANDEX_FM_API_KEY (API-ключ Yandex AI "
-            "Studio — не путать с YANDEX_SEARCH_API_KEY, это другой сервис Yandex Cloud)"
+            "Требуется YANDEX_FM_API_KEY (API-ключ Yandex AI Studio — не путать с "
+            "YANDEX_SEARCH_API_KEY, это другой сервис Yandex Cloud)"
         )
     return OpenAI(api_key=api_key, base_url=YANDEX_FM_BASE_URL)
 
@@ -85,18 +84,17 @@ def _ask_json(
     client=None,
     model: str | None = None,
 ) -> BaseModel:
-    """Общая часть всех classify_*_with_yandexgpt — см.
-    cloudru_classifier._ask_json про мотивацию json_schema (не json_object)
-    и additionalProperties=False; тот же strict-контракт здесь ожидается
-    и от Yandex AI Studio (обе платформы — OpenAI-совместимые эндпоинты
-    поверх response_format json_schema)."""
+    """Общая часть всех classify_*_with_yandexgpt: json_schema (не
+    json_object) + additionalProperties=False — строгий контракт, чтобы
+    структура ответа была гарантирована, а не выведена парсингом
+    произвольного текста."""
     model = model or _default_model()
     if model is None:
         raise RuntimeError(
-            "LLM_PROVIDER=yandexgpt требует YANDEX_FM_MODEL (ID модели из каталога "
-            "Yandex AI Studio, например 'yandexgpt' или 'yandexgpt-lite') и folder_id — "
-            "YANDEX_FM_FOLDER_ID, если ключ AI Studio из другого аккаунта, чем "
-            "YANDEX_SEARCH_API_KEY, иначе достаточно уже заданного YANDEX_FOLDER_ID"
+            "Требуется YANDEX_FM_MODEL (ID модели из каталога Yandex AI Studio, "
+            "например 'yandexgpt' или 'yandexgpt-lite') и folder_id — YANDEX_FM_FOLDER_ID, "
+            "если ключ AI Studio из другого аккаунта, чем YANDEX_SEARCH_API_KEY, иначе "
+            "достаточно уже заданного YANDEX_FOLDER_ID"
         )
     client = client or _client()
     schema_hint = output_model.model_json_schema()
@@ -271,6 +269,100 @@ def extract_brand_with_yandexgpt(raw_query: str, client=None, model: str | None 
         ),
         user_content=f"Запрос байера: {raw_query!r}",
         output_model=BrandGuess,
+        client=client,
+        model=model,
+    )
+
+
+def extract_price_with_yandexgpt(site_text: str, client=None, model: str | None = None) -> PriceGuess:
+    """Слой 2 (см. pipeline._attach_site_price): запасной вариант к
+    PRICE_RE (sources/base.py) — тратится только когда регекс не нашёл
+    цену ни на одной из скачанных страниц сайта. У цены, как и у
+    контактов (в отличие от единиц измерения attribute_extractor.py),
+    нет курируемого словаря форматов — диапазоны, "цена по запросу",
+    зачёркнутая старая цена рядом с новой и т.п., поэтому здесь у LLM
+    реально есть что поймать сверх регекса."""
+    return _ask_json(
+        system_prompt=(
+            "Ты ищешь на тексте сайта компании цену того товара/услуги, которому "
+            "посвящена страница — актуальную розничную/оптовую цену за единицу товара. "
+            "Если указан диапазон или 'от X' — верни минимальное значение диапазона. Если "
+            "рядом две цены (старая зачёркнутая и новая по акции) — верни новую, "
+            "действующую. Верни цену ДОСЛОВНО как написано в тексте, вместе с валютой "
+            "(например, '15 000 руб.'), не пересчитывай и не нормализуй. Если цены на "
+            "странице нет или указано 'цена по запросу' без числа — верни price: null."
+        ),
+        user_content=f"Текст сайта компании (может быть обрезан): {site_text[:8000]!r}",
+        output_model=PriceGuess,
+        client=client,
+        model=model,
+    )
+
+
+def extract_legal_name_with_yandexgpt(
+    site_text: str, client=None, model: str | None = None
+) -> LegalNameGuess:
+    """Слой 2 (см. pipeline._attach_legal_name): запасной вариант к
+    LEGAL_ENTITY_RE (sources/base.py) — тратится только когда регекс не
+    нашёл название юрлица на скачанных страницах сайта. Нужно для
+    повторной попытки резолвинга компании в ЕГРЮЛ (enrichment.py): Dadata
+    suggest ищет по названию ОРГАНИЗАЦИИ, а не по заголовку товарной
+    карточки, которым мы резолвим её по умолчанию."""
+    return _ask_json(
+        system_prompt=(
+            "Ты ищешь на тексте сайта компании ЮРИДИЧЕСКОЕ название организации, "
+            "которой принадлежит сайт — обычно оно встречается в футере (копирайт), в "
+            "разделе 'Реквизиты'/'О компании'/'Контакты', часто рядом с ИНН/ОГРН. "
+            "Название включает организационно-правовую форму: 'ООО', 'АО', 'ЗАО', 'ПАО', "
+            "'ОАО', 'НКО' + собственно название, или 'ИП' + ФИО предпринимателя. Верни "
+            "название ДОСЛОВНО как написано, вместе с формой (например, 'ООО «Диптех»' "
+            "или 'ИП Иванов Иван Иванович'), не только само название без формы. Не путай "
+            "с названием БРЕНДА товара или производителя, чью продукцию продаёт сайт — "
+            "нужно название именно той организации, которой принадлежит сам сайт. Если "
+            "юридическое название нигде не указано — верни legal_name: null."
+        ),
+        user_content=f"Текст сайта компании (может быть обрезан): {site_text[:8000]!r}",
+        output_model=LegalNameGuess,
+        client=client,
+        model=model,
+    )
+
+
+def classify_category_with_yandexgpt(
+    raw_query: str,
+    categories: dict[str, dict],
+    client=None,
+    model: str | None = None,
+) -> CategoryGuess:
+    """Слой 0 (доп., см. pipeline._attach_trusted_suppliers): к какой
+    категории закупок (config/categories.yaml) относится запрос байера —
+    один вызов на запрос, не на кандидата. Используется только как ключ
+    для поиска доверенных поставщиков (trusted_suppliers.py), а не для
+    нормализации/фильтрации самого запроса — design-обсуждение прямо
+    отличает этот случай от прежнего, выпиленного categories.yaml (см.
+    docs/design_doc.md §4): там найденная категория ни на что не влияла
+    дальше по пайплайну, здесь у неё есть реальный потребитель.
+
+    `categories` — код -> {"name": ..., "market": ...} из
+    config.load_categories(), передаётся параметром, а не хардкодится в
+    промпте: список категорий — данные (config/categories.yaml), не код,
+    тот же принцип, что и у словаря единиц измерения в
+    attribute_extractor.py."""
+    categories_hint = "\n".join(f"{code}: {info['name']}" for code, info in categories.items())
+    return _ask_json(
+        system_prompt=(
+            "Ты определяешь, к какой категории закупок относится товар/услуга из запроса "
+            "байера B2B-закупки. Верни КОД категории строго из списка ниже — той, что ближе "
+            "всего по смыслу к запрошенному товару (не по формальному совпадению слов, а по "
+            "сути — что это за товар и для чего он нужен). Если запрос явно не подходит ни "
+            "под одну категорию из списка (никакого разумного совпадения) — верни "
+            "category: null, не выбирай наугад ближайшую по формальному сходству слов.\n\n"
+            "В поле category — ТОЛЬКО код, без названия и без двоеточия (правильно: \"F3\"; "
+            "неправильно: \"F3: СИЛОВОЕ ЭЛЕКТРООБОРУДОВАНИЕ...\").\n\n"
+            f"Категории (код: название):\n{categories_hint}"
+        ),
+        user_content=f"Запрос байера: {raw_query!r}",
+        output_model=CategoryGuess,
         client=client,
         model=model,
     )

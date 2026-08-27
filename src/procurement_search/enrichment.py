@@ -75,6 +75,19 @@ class Enricher(ABC):
         (группа — результат dedup.dedup_candidates)."""
         ...
 
+    def re_resolve(self, company: Company, legal_name: str, candidate_group: list[Candidate]) -> None:
+        """Повторная попытка резолвинга в ЕГРЮЛ с более точным названием
+        компании, найденным на Слое 2 (см. pipeline._attach_legal_name) —
+        вызывается, только когда build_company не смог резолвиться по
+        исходному имени кандидата (заголовок товарной карточки, не
+        название юрлица). Мутирует `company` на месте (inn/ogrn/name/
+        status/contacts), возврата нет.
+
+        По умолчанию — no-op: NullEnricher никуда не резолвит, у него
+        нечего повторять. Единственное содержательное переопределение —
+        DadataEnricher.re_resolve ниже."""
+        return
+
 
 class NullEnricher(Enricher):
     """Заглушка: не резолвит ИНН, не ходит ни в один внешний реестр.
@@ -161,33 +174,44 @@ class DadataEnricher(Enricher):
                 raw_candidates=candidate_group,
             )
 
-        data = match.get("data") or {}
-        name_block = data.get("name") or {}
-        official_name = (
-            name_block.get("full_with_opf")
-            or name_block.get("short_with_opf")
-            or match.get("value")
-            or primary.name_raw
+        inn, ogrn, name_field, status, address_field = _fields_from_suggestion(
+            match, fallback_name=primary.name_raw, source_label="ЕГРЮЛ (Dadata)"
         )
-        status_raw = (data.get("state") or {}).get("status") or ""
-        status = _STATUS_MAP.get(status_raw, "неизвестно")
-
-        today = date.today()
-        address_value = (data.get("address") or {}).get("value")
-        if address_value:
-            contacts.setdefault("address", []).insert(
-                0, FieldValue(address_value, "ЕГРЮЛ (Dadata)", today, VerificationFlag.CONFIRMED)
-            )
+        if address_field is not None:
+            contacts.setdefault("address", []).insert(0, address_field)
 
         return Company(
-            inn=data.get("inn"),
-            ogrn=data.get("ogrn"),
-            name=FieldValue(official_name, "ЕГРЮЛ (Dadata)", today, VerificationFlag.CONFIRMED),
+            inn=inn,
+            ogrn=ogrn,
+            name=name_field,
             status=status,
             contacts=contacts,
             sources=sources,
             raw_candidates=candidate_group,
         )
+
+    def re_resolve(self, company: Company, legal_name: str, candidate_group: list[Candidate]) -> None:
+        """См. Enricher.re_resolve — вызывается pipeline._attach_legal_name
+        только когда build_company не резолвился с первой попытки
+        (company.inn is None), с названием, найденным на Слое 2, вместо
+        заголовка товарной карточки. Не тратит запрос, если компания уже
+        резолвлена — не перепроверяем то, что уже подтвердилось."""
+        if company.inn is not None:
+            return
+        match = self._suggest(legal_name, candidate_group)
+        if match is None:
+            return
+
+        inn, ogrn, name_field, status, address_field = _fields_from_suggestion(
+            match, fallback_name=legal_name, source_label="ЕГРЮЛ (Dadata, по названию со Слоя 2)"
+        )
+        if address_field is not None:
+            company.contacts.setdefault("address", []).insert(0, address_field)
+
+        company.inn = inn
+        company.ogrn = ogrn
+        company.name = name_field
+        company.status = status
 
     def _suggest(self, name: str, candidate_group: list[Candidate]) -> dict | None:
         try:
@@ -213,6 +237,37 @@ class DadataEnricher(Enricher):
 
         suggestions = resp.json().get("suggestions") or []
         return _pick_best_suggestion(suggestions, candidate_group)
+
+
+def _fields_from_suggestion(
+    match: dict, fallback_name: str, source_label: str
+) -> tuple[str | None, str | None, FieldValue, str, FieldValue | None]:
+    """Общая часть DadataEnricher.build_company и .re_resolve — превращает
+    один suggestion Dadata в (inn, ogrn, name FieldValue, status,
+    address FieldValue|None). Вынесено отдельно, чтобы re_resolve не
+    дублировал разбор ответа build_company построчно (см. design-
+    обсуждение про добавление re_resolve для повторной попытки с
+    названием, найденным на Слое 2, а не заголовком товарной карточки)."""
+    data = match.get("data") or {}
+    name_block = data.get("name") or {}
+    official_name = (
+        name_block.get("full_with_opf")
+        or name_block.get("short_with_opf")
+        or match.get("value")
+        or fallback_name
+    )
+    status_raw = (data.get("state") or {}).get("status") or ""
+    status = _STATUS_MAP.get(status_raw, "неизвестно")
+
+    today = date.today()
+    name_field = FieldValue(official_name, source_label, today, VerificationFlag.CONFIRMED)
+    address_value = (data.get("address") or {}).get("value")
+    address_field = (
+        FieldValue(address_value, source_label, today, VerificationFlag.CONFIRMED)
+        if address_value
+        else None
+    )
+    return data.get("inn"), data.get("ogrn"), name_field, status, address_field
 
 
 def _pick_best_suggestion(suggestions: list[dict], candidate_group: list[Candidate]) -> dict | None:

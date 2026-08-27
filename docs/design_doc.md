@@ -293,7 +293,7 @@ SMTP-проверка — не реализованы, остаются в backl
 | Модуль | Статус |
 |---|---|
 | `query_normalizer.py` | Тонкая обёртка `raw_query -> NormalizedQuery` — категорийное сопоставление убрано (§4) |
-| `attribute_extractor.py` / `brand_extractor.py` | Слой 0 — числовые атрибуты и бренд из запроса; LLM-fallback опционален (`use_llm_fallback=False` по умолчанию) через `yandexgpt_classifier.py`/`cloudru_classifier.py` |
+| `attribute_extractor.py` / `brand_extractor.py` | Слой 0 — числовые атрибуты и бренд из запроса; LLM-fallback опционален (`use_llm_fallback=False` по умолчанию) через `yandexgpt_classifier.py` |
 | `sources/google_cse.py`, `sources/yandex_search.py` | Рабочие — официальные API, канал "весь интернет" (§7.1), требуют платных ключей |
 | `sources/yandex_gen_search.py` | Рабочий, опциональный — генеративный ответ поверх Yandex Search API (§7.1) |
 | `dedup.py` | Рабочий — нормализация имени/телефона/домена, слияние дублей |

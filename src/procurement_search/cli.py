@@ -19,7 +19,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def main() -> None:
-    # Подхватывает .env из корня проекта (см. .env.example), если он есть —
+    # Подхватывает .env из корня проекта, если он есть —
     # явный `export` в шелле всё равно имеет приоритет (override=False по
     # умолчанию), .env только подставляет то, что ещё не задано.
     load_dotenv(_PROJECT_ROOT / ".env")
@@ -31,12 +31,24 @@ def main() -> None:
     parser.add_argument(
         "--deep-relevance",
         action="store_true",
-        help="Слой 2: краулить сайты top-N кандидатов и уточнять релевантность по реальному тексту (медленнее)",
+        help=(
+            "Слой 2: краулить сайты top-N кандидатов, уточнять релевантность по реальному "
+            "тексту и сортировать выдачу по найденной цене товара (медленнее)"
+        ),
     )
     parser.add_argument(
         "--relevance-llm-check",
         action="store_true",
-        help="Слой 3: точечная LLM-проверка релевантности поверх --deep-relevance (нужен LLM_PROVIDER)",
+        help="Слой 3: точечная LLM-проверка релевантности поверх --deep-relevance (нужен YANDEX_FM_API_KEY)",
+    )
+    parser.add_argument(
+        "--use-trusted-suppliers",
+        action="store_true",
+        help=(
+            "Слой 0: сначала искать среди уже проверенных поставщиков категории запроса "
+            "(trusted_suppliers.py), глобальный поиск — только если их не хватило "
+            "(нужен YANDEX_FM_API_KEY)"
+        ),
     )
     args = parser.parse_args()
 
@@ -50,6 +62,7 @@ def main() -> None:
         args.output,
         deep_relevance=args.deep_relevance,
         relevance_llm_check=args.relevance_llm_check,
+        use_trusted_suppliers=args.use_trusted_suppliers,
     )
     print(f"Готово: {output}")
 

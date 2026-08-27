@@ -159,6 +159,65 @@ def test_picks_suggestion_whose_address_matches_candidate():
     assert company.inn == "2222222222"
 
 
+def test_re_resolve_fills_in_company_that_failed_first_try():
+    """Первая попытка (build_company по заголовку товарной карточки) не
+    резолвится — re_resolve со Слоя 2 с настоящим названием юрлица должна
+    дорезолвить компанию на месте (design-обсуждение: основной сценарий
+    фикса — Dadata suggest ищет по названию организации, а не по
+    заголовку выдачи)."""
+    session = _FakeSession(_FakeResponse({"suggestions": []}))
+    enricher = DadataEnricher(api_key="test-key", session=session)
+    company = enricher.build_company([_cand(name_raw="Генератор бензиновый Huter DY3000L")])
+    assert company.inn is None  # первая попытка не резолвилась
+
+    session.responses = [_FakeResponse({"suggestions": [_suggestion(status="ACTIVE")]})]
+    enricher.re_resolve(company, "ООО «Диптех»", [_cand(name_raw="Генератор бензиновый Huter DY3000L")])
+
+    assert company.inn == "7700000000"
+    assert company.status == "действующая"
+    assert company.name.value == 'ООО "РОМАШКА"'
+    assert company.name.source == "ЕГРЮЛ (Dadata, по названию со Слоя 2)"
+
+
+def test_re_resolve_does_nothing_when_already_resolved():
+    """Не тратим лишний запрос к Dadata, если компания уже резолвилась
+    с первой попытки — re_resolve не должен трогать уже подтверждённые
+    inn/status/name."""
+    session = _FakeSession(_FakeResponse({"suggestions": [_suggestion(inn="1111111111", status="ACTIVE")]}))
+    enricher = DadataEnricher(api_key="test-key", session=session)
+    company = enricher.build_company([_cand()])
+    assert company.inn == "1111111111"
+    calls_before = len(session.calls)
+
+    enricher.re_resolve(company, "ООО «Другое название»", [_cand()])
+
+    assert len(session.calls) == calls_before  # новый запрос не ушёл
+    assert company.inn == "1111111111"
+
+
+def test_re_resolve_leaves_company_unresolved_when_still_no_match():
+    session = _FakeSession(_FakeResponse({"suggestions": []}))
+    enricher = DadataEnricher(api_key="test-key", session=session)
+    company = enricher.build_company([_cand(name_raw="Совершенно неизвестная контора")])
+
+    enricher.re_resolve(company, "ООО Тоже Неизвестное", [_cand()])
+
+    assert company.inn is None
+    assert company.status == "неизвестно"
+
+
+def test_null_enricher_re_resolve_is_a_noop():
+    from procurement_search.enrichment import NullEnricher
+
+    company = NullEnricher().build_company([_cand()])
+    original_status = company.status
+
+    NullEnricher().re_resolve(company, "ООО «Диптех»", [_cand()])
+
+    assert company.inn is None
+    assert company.status == original_status
+
+
 def test_contacts_from_scraping_stay_unverified():
     session = _FakeSession(_FakeResponse({"suggestions": [_suggestion(status="ACTIVE")]}))
     enricher = DadataEnricher(api_key="test-key", session=session)

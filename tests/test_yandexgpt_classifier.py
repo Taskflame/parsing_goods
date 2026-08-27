@@ -1,18 +1,20 @@
 """Тесты yandexgpt_classifier.py — без сети: OpenAI-совместимый клиент
 подменяется фейком, возвращающим заготовленный JSON в
-response.choices[0].message.content (тот же формат, что и у
-cloudru_classifier.py, см. test_cloudru_classifier.py)."""
+response.choices[0].message.content."""
 
 import pytest
 
 from procurement_search.yandexgpt_classifier import (
     classify_attribute_match_with_yandexgpt,
     classify_attributes_batch_with_yandexgpt,
+    classify_category_with_yandexgpt,
     classify_listing_type_with_yandexgpt,
     classify_relevance_with_yandexgpt,
     classify_stock_status_with_yandexgpt,
     extract_brand_with_yandexgpt,
     extract_contacts_with_yandexgpt,
+    extract_legal_name_with_yandexgpt,
+    extract_price_with_yandexgpt,
 )
 
 
@@ -198,6 +200,72 @@ def test_extract_brand_with_yandexgpt_returns_none_when_no_brand():
     result = extract_brand_with_yandexgpt("насос дренажный 10000 л/час", client=client, model="test-model")
 
     assert result.brand is None
+
+
+def test_extract_price_with_yandexgpt_parses_price():
+    client = _FakeClient('{"price": "15 000 руб.", "reasoning": "указана в карточке товара"}')
+
+    result = extract_price_with_yandexgpt("Насос дренажный, цена 15 000 руб.", client=client, model="test-model")
+
+    assert result.price == "15 000 руб."
+    response_format = client.chat.completions.calls[0]["response_format"]
+    assert response_format["json_schema"]["name"] == "PriceGuess"
+
+
+def test_extract_price_with_yandexgpt_returns_none_when_no_price():
+    client = _FakeClient('{"price": null, "reasoning": "цена по запросу, числа нет"}')
+
+    result = extract_price_with_yandexgpt("Насос дренажный, цена по запросу", client=client, model="test-model")
+
+    assert result.price is None
+
+
+def test_extract_legal_name_with_yandexgpt_parses_name():
+    client = _FakeClient('{"legal_name": "ООО «Диптех»", "reasoning": "указано в футере сайта"}')
+
+    result = extract_legal_name_with_yandexgpt(
+        "© 2024 ООО «Диптех». Продаём генераторы Huter.", client=client, model="test-model"
+    )
+
+    assert result.legal_name == "ООО «Диптех»"
+    response_format = client.chat.completions.calls[0]["response_format"]
+    assert response_format["json_schema"]["name"] == "LegalNameGuess"
+
+
+def test_extract_legal_name_with_yandexgpt_returns_none_when_not_found():
+    client = _FakeClient('{"legal_name": null, "reasoning": "юрлицо на странице не указано"}')
+
+    result = extract_legal_name_with_yandexgpt("Каталог товаров", client=client, model="test-model")
+
+    assert result.legal_name is None
+
+
+_CATEGORIES = {
+    "F3": {"name": "СИЛОВОЕ ЭЛЕКТРООБОРУДОВАНИЕ И ДОПОЛНИТЕЛЬНОЕ ОБОРУДОВАНИЕ", "market": "EE"},
+    "K1": {"name": "КРЕПЕЖИ", "market": "FC"},
+}
+
+
+def test_classify_category_with_yandexgpt_parses_code():
+    client = _FakeClient('{"category": "F3", "reasoning": "генератор — силовое электрооборудование"}')
+
+    result = classify_category_with_yandexgpt(
+        "генератор бензиновый Huter 2,5 квт", _CATEGORIES, client=client, model="test-model"
+    )
+
+    assert result.category == "F3"
+    response_format = client.chat.completions.calls[0]["response_format"]
+    assert response_format["json_schema"]["name"] == "CategoryGuess"
+    user_message = client.chat.completions.calls[0]["messages"][0]["content"]
+    assert "F3" in user_message and "КРЕПЕЖИ" in user_message
+
+
+def test_classify_category_with_yandexgpt_returns_none_when_nothing_fits():
+    client = _FakeClient('{"category": null, "reasoning": "запрос не про закупку товара"}')
+
+    result = classify_category_with_yandexgpt("сколько сейчас времени", _CATEGORIES, client=client, model="test-model")
+
+    assert result.category is None
 
 
 def test_extract_contacts_with_yandexgpt_parses_partial_result():

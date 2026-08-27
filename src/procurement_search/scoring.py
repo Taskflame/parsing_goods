@@ -294,6 +294,25 @@ def weights_for_category(category: str | None, weights_cfg: dict) -> dict:
 _WEBSITE_DOMAIN_RE = re.compile(r"https?://(?:www\.)?([\w.\-]+)", re.IGNORECASE)
 
 
+def company_domain(company: Company) -> str | None:
+    """Домен сайта компании (без схемы/www), или None, если сайта нет/не
+    распознан. Общая часть is_marketplace_domain ниже и
+    pipeline._write_back_trusted_suppliers: заголовок страницы из выдачи
+    нестабилен между прогонами (один и тот же сайт сегодня приходит как
+    "Генератор бензиновый Huter DY3000L", завтра как "Купить генераторы
+    Huter — официальный сайт"), а домен стабилен и есть всегда, раз
+    результат вообще существует — поэтому именно он, а не имя компании,
+    служит ключом поставщика в базе доверенных поставщиков
+    (trusted_suppliers.py)."""
+    website_entries = company.contacts.get("website", [])
+    if not website_entries:
+        return None
+    match = _WEBSITE_DOMAIN_RE.search(website_entries[0].value)
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
 def is_marketplace_domain(company: Company, marketplace_domains: list[str]) -> bool:
     """Сайт компании — крупный B2C-маркетплейс/классифайд (см.
     config/marketplace_domains.yaml), а не собственный сайт поставщика.
@@ -304,13 +323,9 @@ def is_marketplace_domain(company: Company, marketplace_domains: list[str]) -> b
     топе только когда с других источников не набралось достаточно
     кандидатов (design-обсуждение: DNS/Ozon/Wildberries для B2B-закупки —
     не поставщик, а розница/перекупщик, но лучше показать их, чем ничего)."""
-    website_entries = company.contacts.get("website", [])
-    if not website_entries:
+    domain = company_domain(company)
+    if domain is None:
         return False
-    match = _WEBSITE_DOMAIN_RE.search(website_entries[0].value)
-    if match is None:
-        return False
-    domain = match.group(1).lower()
     return any(domain == d or domain.endswith("." + d) for d in marketplace_domains)
 
 

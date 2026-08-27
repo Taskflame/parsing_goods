@@ -66,8 +66,6 @@ def test_no_llm_call_by_default_for_naked_number(monkeypatch):
 
 
 def test_llm_fallback_resolves_naked_number_when_enabled(monkeypatch):
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-
     def fake_classify(raw_query, naked_numbers, units, **kwargs):
         assert naked_numbers == ["5000"]
         assert "т" in units
@@ -93,7 +91,6 @@ def test_llm_fallback_resolves_multiple_naked_numbers_in_one_batch_call(monkeypa
     """Проверяет, что для нескольких голых чисел делается ОДИН вызов LLM
     (не N), и что raw может быть шире одного числа — вырезается из
     clean_text дословной подстрокой, а не только по значению числа."""
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
     calls = []
 
     def fake_classify(raw_query, naked_numbers, units, **kwargs):
@@ -120,8 +117,6 @@ def test_llm_fallback_resolves_multiple_naked_numbers_in_one_batch_call(monkeypa
 
 
 def test_llm_fallback_unit_outside_dictionary_is_ignored(monkeypatch):
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-
     def fake_classify(raw_query, naked_numbers, units, **kwargs):
         return AttributeBatchGuess(
             attributes=[AttributeBatchItem(value="5000", unit="дюйм", raw="5000", reasoning="ошибка модели")]
@@ -137,8 +132,6 @@ def test_llm_fallback_unit_outside_dictionary_is_ignored(monkeypatch):
 
 
 def test_llm_fallback_value_outside_naked_numbers_is_ignored(monkeypatch):
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-
     def fake_classify(raw_query, naked_numbers, units, **kwargs):
         # Модель вернула значение, которого не было в списке запрошенных —
         # не должно попасть в результат.
@@ -156,8 +149,6 @@ def test_llm_fallback_value_outside_naked_numbers_is_ignored(monkeypatch):
 
 
 def test_llm_fallback_survives_errors(monkeypatch):
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-
     def fake_classify(*args, **kwargs):
         raise RuntimeError("network unreachable")
 
@@ -168,31 +159,6 @@ def test_llm_fallback_survives_errors(monkeypatch):
     result = extract_attributes("труба 5000 непонятная", units=UNITS, use_llm_fallback=True)
 
     assert result.attributes == []
-
-
-def test_llm_provider_cloudru_used_when_selected(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "cloudru")
-
-    def fake_classify_yandexgpt(*args, **kwargs):
-        raise AssertionError("должен вызываться cloudru, а не yandexgpt (дефолт)")
-
-    def fake_classify_cloudru(raw_query, naked_numbers, units, **kwargs):
-        return AttributeBatchGuess(
-            attributes=[AttributeBatchItem(value="5000", unit="т", raw="5000", reasoning="Cloud.ru")]
-        )
-
-    monkeypatch.setattr(
-        "procurement_search.yandexgpt_classifier.classify_attributes_batch_with_yandexgpt", fake_classify_yandexgpt
-    )
-    monkeypatch.setattr(
-        "procurement_search.cloudru_classifier.classify_attributes_batch_with_cloudru", fake_classify_cloudru
-    )
-
-    result = extract_attributes(
-        "перевозка груза 5000 без единицы", units=UNITS, use_llm_fallback=True
-    )
-
-    assert result.attributes == [_attr("5000", "т", "5000", source="llm")]
 
 
 def _attr(value: str, unit: str, raw_text: str, source: str = "dict"):

@@ -102,6 +102,15 @@ class Company:
     years_in_business: FieldValue | None = None
     revenue_last_2y: list[FieldValue] = field(default_factory=list)
 
+    # Цена товара с сайта кандидата (Слой 2, см. pipeline._attach_site_price) —
+    # единственное значение, не список: в отличие от contacts (несколько
+    # источников по одному кандидату — сниппет + сайт), цена берётся
+    # только с самого сайта, второго источника для неё нет. Используется
+    # в pipeline._ranking_key как отдельный KPI финальной сортировки
+    # (design-обсуждение: явный запрос байера — цена дешевле выше, поверх
+    # уже готового списка, а не ещё один вес внутри compute_score).
+    price: FieldValue | None = None
+
     sources: list[str] = field(default_factory=list)
     raw_candidates: list[Candidate] = field(default_factory=list)
 

@@ -124,9 +124,10 @@
     <h2>Новый поиск</h2>
     <form class="search-form" id="search-form">
       <input type="text" id="query" placeholder="Например: гальванические покрытия" required>
-      <label><input type="checkbox" id="use-llm"> LLM-fallback: категория, опечатки в единицах измерения, бренд в поиске (нужен LLM_PROVIDER: yandexgpt/cloudru)</label>
-      <label><input type="checkbox" id="deep-relevance"> Слой 2: краулить сайты кандидатов (медленнее, точнее)</label>
+      <label><input type="checkbox" id="use-llm"> LLM-fallback: опечатки в единицах измерения, бренд в поиске (нужен YANDEX_FM_API_KEY)</label>
+      <label><input type="checkbox" id="deep-relevance"> Слой 2: краулить сайты кандидатов, находить цену и сортировать по ней (медленнее, точнее)</label>
       <label><input type="checkbox" id="relevance-llm-check"> LLM-фильтр: статьи/видео сразу; соответствие товара, характеристик и наличие товара — вместе со Слоем 2</label>
+      <label><input type="checkbox" id="use-trusted-suppliers"> Сначала искать среди проверенных поставщиков категории, потом — глобальный поиск (нужен YANDEX_FM_API_KEY)</label>
       <button type="submit" id="submit-btn">Найти</button>
     </form>
     <div id="status"></div>
@@ -145,6 +146,7 @@
             <th>Сайт</th>
             <th>Источники</th>
             <th>Наличие товара</th>
+            <th>Цена</th>
             <th>Relevance</th>
             <th>Trust</th>
             <th>Данные</th>
@@ -232,6 +234,7 @@ function renderResults(companies) {
       <td>${websiteCell(c.website)}</td>
       <td>${c.sources.join(', ')}</td>
       <td>${stockBadge(c.stock_status)}</td>
+      <td>${c.price ? c.price.value : '<span class="muted">—</span>'}</td>
       <td>${relevance}</td>
       <td>${trust}</td>
       <td>${confidence}</td>
@@ -266,6 +269,7 @@ form.addEventListener('submit', async (e) => {
   const useLlm = document.getElementById('use-llm').checked;
   const deepRelevance = document.getElementById('deep-relevance').checked;
   const relevanceLlmCheck = document.getElementById('relevance-llm-check').checked;
+  const useTrustedSuppliers = document.getElementById('use-trusted-suppliers').checked;
 
   submitBtn.disabled = true;
   statusEl.className = '';
@@ -283,6 +287,7 @@ form.addEventListener('submit', async (e) => {
         use_llm_fallback: useLlm,
         deep_relevance: deepRelevance,
         relevance_llm_check: relevanceLlmCheck,
+        use_trusted_suppliers: useTrustedSuppliers,
       }),
     });
     if (!resp.ok) {

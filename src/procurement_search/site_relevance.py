@@ -87,12 +87,32 @@ def crawl_site_text(
         return None
     base = f"{parsed.scheme}://{parsed.netloc}"
 
-    texts: list[str] = []
+    # Сама найденная ссылка (Candidate.website — для активных источников,
+    # google_cse.py/yandex_search.py, это URL результата поиска целиком, с
+    # путём, часто прямая карточка конкретного товара) должна попасть в
+    # обход ПЕРВОЙ, а не потеряться. Раньше путь молча отбрасывался —
+    # оставался только "scheme://netloc", а дальше крауler шёл по общим
+    # разделам сайта из _CANDIDATE_PATHS (каталог/о нас/контакты). Для
+    # текста в целом это не критично (Слой 2 всё равно сравнивает по
+    # токенам с других страниц тоже), но для цены товара (Слой 2, доп.,
+    # см. pipeline._attach_site_price) это оказалось решающим: регекс/LLM
+    # видели случайную страницу сайта, а не ту, где реально написана цена
+    # ИМЕННО этого товара — отсюда цены "не с той карточки" на живой выдаче.
+    urls_to_try: list[str] = []
+    if parsed.path not in ("", "/") or parsed.query:
+        original_url = base + parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        urls_to_try.append(original_url)
     for path in _CANDIDATE_PATHS:
+        url = base + path
+        if url not in urls_to_try:
+            urls_to_try.append(url)
+
+    texts: list[str] = []
+    for url in urls_to_try:
         if len(texts) >= max_pages:
             break
         html = fetch_url(
-            base + path,
+            url,
             user_agent=user_agent,
             timeout=timeout,
             delay=delay,

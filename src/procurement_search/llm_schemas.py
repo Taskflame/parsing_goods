@@ -1,8 +1,7 @@
-"""Общие Pydantic-схемы structured output для всех LLM-провайдеров
-(yandexgpt_classifier.py — боевой по умолчанию, cloudru_classifier.py —
-запасной вариант). Вынесены в отдельный модуль, а не определены в одном
-из провайдеров, чтобы ни один провайдер не был "главным" источником
-контракта для остальных — оба импортируют схемы отсюда на равных.
+"""Общие Pydantic-схемы structured output для LLM-провайдера
+(yandexgpt_classifier.py). Вынесены в отдельный модуль, а не определены
+прямо в yandexgpt_classifier.py — чтобы схемы контракта были отделены от
+кода, который их использует.
 """
 
 from __future__ import annotations
@@ -39,6 +38,21 @@ class AttributeMatchVerdict(BaseModel):
 
 class ListingTypeVerdict(BaseModel):
     is_listing: bool
+    reasoning: str
+
+
+class PriceGuess(BaseModel):
+    price: str | None
+    reasoning: str
+
+
+class LegalNameGuess(BaseModel):
+    legal_name: str | None
+    reasoning: str
+
+
+class CategoryGuess(BaseModel):
+    category: str | None
     reasoning: str
 
 
