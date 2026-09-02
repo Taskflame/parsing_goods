@@ -11,6 +11,7 @@ from procurement_search.yandexgpt_classifier import (
     classify_listing_type_with_yandexgpt,
     classify_relevance_with_yandexgpt,
     classify_stock_status_with_yandexgpt,
+    extract_availability_with_yandexgpt,
     extract_brand_with_yandexgpt,
     extract_contacts_with_yandexgpt,
     extract_legal_name_with_yandexgpt,
@@ -114,13 +115,84 @@ def test_classify_attributes_batch_with_yandexgpt_parses_units():
 
 
 def test_classify_stock_status_with_yandexgpt_parses_verdict():
-    client = _FakeClient('{"out_of_stock": true, "reasoning": "плашка \'товар закончился\'"}')
+    client = _FakeClient(
+        '{"status": "out_of_stock", "quote": "Товар закончился", '
+        '"reasoning": "плашка \'товар закончился\'"}'
+    )
 
     result = classify_stock_status_with_yandexgpt(
         "Насос дренажный. Товар закончился.", client=client, model="test-model"
     )
 
-    assert result.out_of_stock is True
+    assert result.status == "out_of_stock"
+    assert result.quote == "Товар закончился"
+
+
+def test_classify_stock_status_prompt_does_not_treat_cart_button_as_in_stock():
+    """Регрессия по реальному кейсу с живой выдачи (san-sanych.ru): страница
+    показывала «Ожидается поставка на 31.08» рядом с активной кнопкой «В
+    корзину» — старый промпт явно называл кнопку триггером in_stock, из-за
+    чего модель игнорировала более специфичный маркер срока поставки.
+    Кнопка сама по себе НЕ должна быть в списке триггеров in_stock, и
+    промпт должен явно требовать приоритет маркера срока/даты поставки."""
+    client = _FakeClient('{"status": "in_stock", "quote": null, "reasoning": "тест"}')
+
+    classify_stock_status_with_yandexgpt("текст сайта", client=client, model="test-model")
+
+    system_prompt = client.chat.completions.calls[0]["messages"][0]["content"]
+    assert "кнопка" not in system_prompt.lower().split("важно")[0]
+    assert "перевешивает" in system_prompt or "приоритет" in system_prompt
+
+
+def test_extract_availability_with_yandexgpt_parses_on_order():
+    """on_order — отдельный статус именно для случая 'товара нет на складе,
+    но есть дата/срок будущей поставки' (см. models.AvailabilityStatus).
+    Регрессия: старый промпт вообще не объяснял модели, что означает
+    on_order, и не отличал его от unknown/in_stock."""
+    client = _FakeClient(
+        '{"is_product_page": true, "status": "on_order", "quantity": null, '
+        '"quantity_unit": null, "pack_size_qty": null, "pack_size_unit": null, '
+        '"min_order_qty": null, "min_order_unit": null, "lead_time_days": null, '
+        '"price": "1 051,03 ₽", "evidence": "Ожидается поставка на 31.08", '
+        '"reasoning": "явный маркер срока поставки"}'
+    )
+
+    result = extract_availability_with_yandexgpt(
+        "труба стальная черная 3/4", "В корзину. Ожидается поставка на 31.08.",
+        client=client, model="test-model",
+    )
+
+    assert result.status == "on_order"
+    assert result.evidence == "Ожидается поставка на 31.08"
+
+    system_prompt = client.chat.completions.calls[0]["messages"][0]["content"]
+    assert "on_order" in system_prompt
+    assert "кнопка" in system_prompt.lower()
+
+
+def test_extract_availability_prompt_warns_against_picking_one_pickup_point():
+    """Регрессия по реальному кейсу с живой выдачи (pro-electro.ru):
+    остаток показан отдельно по нескольким точкам самовывоза (несколько
+    строк 'город, адрес — N шт'), а модель взяла число только с одной
+    строки как итоговое — теряя остальные точки. Промпт должен явно
+    требовать сумму по всем видимым точкам или честный null при
+    неуверенности, а не произвольный выбор одной строки."""
+    client = _FakeClient(
+        '{"is_product_page": true, "status": "in_stock", "quantity": null, '
+        '"quantity_unit": null, "pack_size_qty": null, "pack_size_unit": null, '
+        '"min_order_qty": null, "min_order_unit": null, "lead_time_days": null, '
+        '"price": null, "evidence": "остаток по точкам самовывоза, полный список не виден", '
+        '"reasoning": "несколько точек самовывоза"}'
+    )
+
+    extract_availability_with_yandexgpt(
+        "бензогенератор Huter", "г. Томск ул. X — 1 шт г. Томск ул. Y — 1 шт",
+        client=client, model="test-model",
+    )
+
+    system_prompt = client.chat.completions.calls[0]["messages"][0]["content"]
+    assert "самовывоз" in system_prompt.lower()
+    assert "просумм" in system_prompt.lower()
 
 
 def test_ask_json_sends_json_schema_matching_output_model():

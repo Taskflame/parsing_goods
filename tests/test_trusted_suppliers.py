@@ -96,3 +96,120 @@ def test_store_persists_across_reopen(tmp_path):
 
     with TrustedSupplierStore(db_path) as reopened:
         assert reopened.domains_for_category("F3") == ["huterrussia.ru"]
+
+
+def test_list_all_aggregates_categories_and_best_rank(tmp_path):
+    """Один и тот же домен писался под двумя разными категориями и дважды
+    под F3 (ранги 2 и 1) — list_all должна дать ОДНУ строку на домен, с
+    обеими категориями и лучшим (минимальным) рангом из всей истории."""
+    with TrustedSupplierStore(tmp_path / "test.db") as store:
+        store.record_supplier(
+            domain="huterrussia.ru", name="Huter", category_code="F3", rank=2, source_query="q1"
+        )
+        store.record_supplier(
+            domain="huterrussia.ru", name="Huter", category_code="F3", rank=1, source_query="q2"
+        )
+        store.record_supplier(
+            domain="huterrussia.ru", name="Huter", category_code="K1", rank=3, source_query="q3"
+        )
+        store.record_supplier(
+            domain="other.example", name="Other", category_code="K1", rank=1, source_query="q4"
+        )
+
+        rows = store.list_all()
+
+    assert len(rows) == 2
+    huter_row = next(r for r in rows if r["domain"] == "huterrussia.ru")
+    assert set(huter_row["categories"].split(",")) == {"F3", "K1"}
+    assert huter_row["times_recorded"] == 3
+    assert huter_row["best_rank"] == 1
+
+
+def test_list_all_empty_when_nothing_recorded(tmp_path):
+    with TrustedSupplierStore(tmp_path / "test.db") as store:
+        assert store.list_all() == []
+
+
+def test_delete_supplier_removes_domain_and_full_history(tmp_path):
+    with TrustedSupplierStore(tmp_path / "test.db") as store:
+        store.record_supplier(
+            domain="huterrussia.ru", name="Huter", category_code="F3", rank=1, source_query="q1"
+        )
+        store.record_supplier(
+            domain="huterrussia.ru", name="Huter", category_code="K1", rank=2, source_query="q2"
+        )
+
+        deleted = store.delete_supplier("huterrussia.ru")
+
+        assert deleted is True
+        assert store.get_supplier("huterrussia.ru") is None
+        assert store.domains_for_category("F3") == []
+        assert store.domains_for_category("K1") == []
+
+
+def test_delete_supplier_returns_false_for_unknown_domain(tmp_path):
+    with TrustedSupplierStore(tmp_path / "test.db") as store:
+        assert store.delete_supplier("unknown.example") is False
+
+
+def test_list_by_category_groups_suppliers_under_their_category(tmp_path):
+    with TrustedSupplierStore(tmp_path / "test.db") as store:
+        store.record_supplier(
+            domain="huterrussia.ru", name="Huter", category_code="F3", rank=1, source_query="q1"
+        )
+        store.record_supplier(
+            domain="huter.su", name="Huter Su", category_code="F3", rank=2, source_query="q2"
+        )
+        store.record_supplier(
+            domain="clasta.ru", name="Clasta", category_code="E1", rank=1, source_query="q3"
+        )
+
+        groups = store.list_by_category()
+
+    assert [g["category_code"] for g in groups] == ["E1", "F3"]
+    f3 = next(g for g in groups if g["category_code"] == "F3")
+    assert [s["domain"] for s in f3["suppliers"]] == ["huterrussia.ru", "huter.su"]  # по best_rank
+
+
+def test_list_by_category_keeps_per_category_rank_separate():
+    """Один и тот же домен под ДВУМЯ категориями с разными рангами —
+    каждая категория должна показать СВОЙ собственный ранг этого домена,
+    не смешанный со вторым (в отличие от list_all(), где ранг общий на
+    оба вхождения сразу)."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with TrustedSupplierStore(Path(tmp) / "test.db") as store:
+            store.record_supplier(
+                domain="huterrussia.ru", name="Huter", category_code="F3", rank=1, source_query="q1"
+            )
+            store.record_supplier(
+                domain="huterrussia.ru", name="Huter", category_code="K1", rank=5, source_query="q2"
+            )
+
+            groups = store.list_by_category()
+
+    by_category = {g["category_code"]: g["suppliers"][0] for g in groups}
+    assert by_category["F3"]["best_rank"] == 1
+    assert by_category["K1"]["best_rank"] == 5
+
+
+def test_list_by_category_empty_when_nothing_recorded(tmp_path):
+    with TrustedSupplierStore(tmp_path / "test.db") as store:
+        assert store.list_by_category() == []
+
+
+def test_delete_supplier_does_not_touch_other_domains(tmp_path):
+    with TrustedSupplierStore(tmp_path / "test.db") as store:
+        store.record_supplier(
+            domain="huterrussia.ru", name="Huter", category_code="F3", rank=1, source_query="q1"
+        )
+        store.record_supplier(
+            domain="other.example", name="Other", category_code="F3", rank=2, source_query="q2"
+        )
+
+        store.delete_supplier("huterrussia.ru")
+
+        assert store.get_supplier("other.example") is not None
+        assert store.domains_for_category("F3") == ["other.example"]

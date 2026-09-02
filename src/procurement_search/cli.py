@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from procurement_search.log_explainer import ExplainingLogHandler
 from procurement_search.pipeline import run_pipeline
 
 # Путь к .env вычисляется от расположения этого файла, а не через
@@ -50,12 +51,36 @@ def main() -> None:
             "(нужен YANDEX_FM_API_KEY)"
         ),
     )
+    parser.add_argument(
+        "--check-availability",
+        action="store_true",
+        help=(
+            "Слой 4: проверять остаток товара и сравнивать с запрошенным количеством "
+            "(требует --deep-relevance и YANDEX_FM_API_KEY, отдельная от --relevance-llm-check "
+            "и более дорогая LLM-проверка)"
+        ),
+    )
+    parser.add_argument(
+        "--probe-stepper",
+        action="store_true",
+        help=(
+            "ПИЛОТ: интерактивная проверка остатка через степпер количества на странице "
+            "(headless-браузер, требует --check-availability и `pip install playwright && "
+            "playwright install chromium`) — эвристика, не гарантия, см. stepper_probe.py. "
+            "Заметно медленнее (реальный браузер на кандидата), запускается только для "
+            "кандидатов с неясным вердиктом Слоя 4"
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Вариант А (design-обсуждение) — детерминированный объяснитель
+    # известных ошибок, без LLM (см. log_explainer.py). Всегда включён —
+    # бесплатный, ничего не ломает, ничего не отправляет по сети.
+    logging.getLogger().addHandler(ExplainingLogHandler())
 
     output = run_pipeline(
         args.query,
@@ -63,6 +88,8 @@ def main() -> None:
         deep_relevance=args.deep_relevance,
         relevance_llm_check=args.relevance_llm_check,
         use_trusted_suppliers=args.use_trusted_suppliers,
+        check_availability=args.check_availability,
+        probe_stepper=args.probe_stepper,
     )
     print(f"Готово: {output}")
 

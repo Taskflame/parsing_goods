@@ -2,12 +2,24 @@
 подменяются, чтобы протестировать normalize -> dedup -> score -> export
 как единое целое (design_doc §3)."""
 
-from datetime import date
+from datetime import date, datetime
 
+from procurement_search.attribute_extractor import Quantity
 from procurement_search.enrichment import DadataEnricher, Enricher, NullEnricher
-from procurement_search.models import Candidate, Company, FieldValue, StockStatus, VerificationFlag
+from procurement_search.models import (
+    Availability,
+    AvailabilityStatus,
+    Candidate,
+    Company,
+    FieldValue,
+    ScoreBreakdown,
+    StockStatus,
+    VerificationFlag,
+)
 from procurement_search import pipeline
 from procurement_search.pipeline import run_pipeline, search_and_score
+from procurement_search.quantity_match import Verdict
+from procurement_search.stepper_probe import StepperProbeResult
 from procurement_search.trusted_suppliers import TrustedSupplierStore
 
 import openpyxl
@@ -422,7 +434,9 @@ def test_deep_relevance_llm_marks_out_of_stock_without_touching_score(monkeypatc
     )
     monkeypatch.setattr(pipeline, "classify_relevance", lambda raw_query, site_text: True)
     monkeypatch.setattr(pipeline, "check_attribute_match", lambda raw_query, site_text: True)
-    monkeypatch.setattr(pipeline, "classify_stock_status", lambda site_text: True)
+    monkeypatch.setattr(
+        pipeline, "classify_stock_status", lambda site_text: ("out_of_stock", "Товар закончился")
+    )
 
     without_llm = search_and_score("гальванические покрытия", deep_relevance=True)
     with_llm = search_and_score(
@@ -431,6 +445,7 @@ def test_deep_relevance_llm_marks_out_of_stock_without_touching_score(monkeypatc
 
     assert without_llm[0].stock_status == StockStatus.NOT_CHECKED
     assert with_llm[0].stock_status == StockStatus.OUT_OF_STOCK
+    assert with_llm[0].stock_status_quote == "Товар закончился"
     assert with_llm[0].score.relevance == without_llm[0].score.relevance
 
 
@@ -1282,3 +1297,652 @@ def test_trusted_suppliers_write_back_records_top_n_excluding_marketplace(monkey
     assert "good1.example" in domains
     assert "good2.example" in domains
     assert "ozon.ru" not in domains
+
+
+# --- check_availability (Слой 4, см. availability.py/quantity_match.py) ---
+
+
+def test_order_qty_never_leaks_into_search_terms(monkeypatch):
+    """Слой 0.6 (classify_roles) — order_qty ("11 шт") — количество
+    ЗАКУПКИ, не характеристика товара; попадание в поисковый запрос
+    зашумляло бы выдачу Yandex/Google цифрами, не относящимися к самому
+    товару. Регрессия: раньше search_terms[0] всегда был raw_query целиком
+    (см. pipeline.py про search_raw_query)."""
+    search_calls: list[str] = []
+
+    def fake_search(query: str) -> list[Candidate]:
+        search_calls.append(query)
+        return []
+
+    _patch_sources(monkeypatch, fake_search)
+
+    search_and_score("генератор бензиновый Hunter 11 шт", verify_websites=False)
+
+    assert search_calls  # источник реально вызывался хотя бы раз
+    for query in search_calls:
+        assert "11 шт" not in query
+
+
+def test_order_length_never_leaks_into_search_terms(monkeypatch):
+    """Метраж закупки (order_length, "50 метров") — тот же принцип, что и
+    order_qty: количество ЗАКУПКИ, не характеристика товара, не должен
+    попадать в поисковый запрос."""
+    search_calls: list[str] = []
+
+    def fake_search(query: str) -> list[Candidate]:
+        search_calls.append(query)
+        return []
+
+    _patch_sources(monkeypatch, fake_search)
+
+    search_and_score("кабель ВВГ 3х2,5 500 метров", verify_websites=False)
+
+    assert search_calls
+    for query in search_calls:
+        assert "500 метров" not in query
+
+
+def test_search_result_exposes_order_length_and_effective_amount(monkeypatch):
+    def fake_candidates(query: str) -> list[Candidate]:
+        return []
+
+    _patch_sources(monkeypatch, fake_candidates)
+
+    result = search_and_score("кабель ВВГ 3х2,5 500 метров", verify_websites=False)
+
+    assert result.order_qty is None
+    assert result.order_length == Quantity(500.0, "м", "500 метров")
+    assert result.effective_order_amount() == Quantity(500.0, "м", "500 метров")
+
+
+def test_check_availability_compares_order_length_against_site_meters(monkeypatch):
+    """Полный сквозной путь для метража: сайт кандидата сообщает остаток в
+    метрах — Слой 4 должен сравнить его именно с order_length (не
+    order_qty, которого в этом запросе нет), тем же quantity_match.compare,
+    что и для штучного товара."""
+
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="ООО Кабель",
+                description_raw="кабель ВВГ",
+                website="https://x.example",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: "кабель ВВГ, в наличии")
+
+    def fake_extract_availability(product_description, site_text, source_url, units=None):
+        return Availability(
+            status=AvailabilityStatus.IN_STOCK_QTY,
+            quantity=Quantity(300.0, "м", "300 метров"),
+            pack_size=None,
+            min_order=None,
+            lead_time_days=None,
+            price=None,
+            source_url=source_url,
+            checked_at=datetime.now(),
+            evidence="в наличии: 300 метров",
+        )
+
+    monkeypatch.setattr(pipeline, "extract_product_availability", fake_extract_availability)
+
+    result = search_and_score(
+        "кабель ВВГ 3х2,5 500 метров", deep_relevance=True, check_availability=True
+    )
+
+    assert result[0].availability_verdict == Verdict.NOT_ENOUGH.value
+    assert "300" in result[0].availability_verdict_text and "500" in result[0].availability_verdict_text
+
+
+def test_summarize_availability_works_with_length_amount():
+    order_length = Quantity(500.0, "м", "500 метров")
+
+    def _company_with_length(name: str, meters: float) -> Company:
+        company = Company(
+            inn=None, ogrn=None, name=FieldValue(name, "test", date(2026, 1, 1)), status="неизвестно"
+        )
+        company.availability = Availability(
+            status=AvailabilityStatus.IN_STOCK_QTY,
+            quantity=Quantity(meters, "м", f"{meters:g} метров"),
+            pack_size=None,
+            min_order=None,
+            lead_time_days=None,
+            price=None,
+            source_url="https://x.example",
+            checked_at=datetime.now(),
+            evidence=None,
+        )
+        return company
+
+    companies = [_company_with_length("Поставщик А", 600.0), _company_with_length("Поставщик Б", 250.0)]
+
+    summary = pipeline.summarize_availability(companies, order_length)
+
+    assert summary is not None
+    assert "Требуется: 500 м" in summary
+    assert "850 м" in summary and "2 поставщиков" in summary
+    assert "Поставщик А" in summary and "да" in summary
+
+
+def test_check_availability_without_deep_relevance_is_noop(monkeypatch):
+    """check_availability требует deep_relevance=True (нечего проверять без
+    текста сайта top-N кандидатов) — без него флаг не должен ронять
+    пайплайн, просто ничего не делает."""
+
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="ООО Тест",
+                description_raw="",
+            )
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+
+    companies = search_and_score(
+        "генератор бензиновый 11 шт", check_availability=True, verify_websites=False
+    )
+
+    assert companies[0].availability is None
+    assert companies[0].availability_verdict is None
+
+
+def test_check_availability_populates_fields_and_excludes_out_of_stock(monkeypatch):
+    """Слой 4 заполняет company.availability/availability_verdict(_text) по
+    top-N кандидатам, а поставщик с подтверждённым OUT_OF_STOCK исключается
+    из финальной выдачи целиком (knockout, тот же паттерн, что у ЕГРЮЛ-
+    отсечки) — в отличие от NOT_ENOUGH/UNKNOWN, которые остаются в выдаче."""
+
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://instock.example/1",
+                name_raw="ООО В наличии",
+                description_raw="генератор бензиновый",
+                website="https://instock.example",
+            ),
+            Candidate(
+                source="yandex_search",
+                source_url="https://outofstock.example/1",
+                name_raw="ООО Нет в наличии",
+                description_raw="генератор бензиновый",
+                website="https://outofstock.example",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: f"текст сайта {url}")
+
+    def fake_extract_availability(product_description, site_text, source_url, units=None):
+        if "outofstock" in source_url:
+            return Availability(
+                status=AvailabilityStatus.OUT_OF_STOCK,
+                quantity=None,
+                pack_size=None,
+                min_order=None,
+                lead_time_days=None,
+                price=None,
+                source_url=source_url,
+                checked_at=datetime.now(),
+                evidence="нет в наличии",
+            )
+        return Availability(
+            status=AvailabilityStatus.IN_STOCK_QTY,
+            quantity=Quantity(15.0, "шт", "15 шт"),
+            pack_size=None,
+            min_order=None,
+            lead_time_days=None,
+            price=None,
+            source_url=source_url,
+            checked_at=datetime.now(),
+            evidence="в наличии: 15 шт",
+        )
+
+    monkeypatch.setattr(pipeline, "extract_product_availability", fake_extract_availability)
+
+    companies = search_and_score(
+        "генератор бензиновый 11 шт", deep_relevance=True, check_availability=True
+    )
+
+    assert len(companies) == 1
+    assert companies[0].name.value == "ООО В наличии"
+    assert companies[0].availability.quantity == Quantity(15.0, "шт", "15 шт")
+    assert companies[0].availability_verdict == Verdict.ENOUGH.value
+    assert "15" in companies[0].availability_verdict_text
+
+
+def test_check_availability_price_fills_in_when_attach_site_price_fails(monkeypatch):
+    """Регрессия по реальному кейсу с живой выдачи (prom55.ru): цена не
+    найдена ни regex'ом (PRICE_RE), ни отдельным LLM-вызовом extract_price
+    (relevance_llm_check=False здесь — намеренно, чтобы _attach_site_price
+    гарантированно не нашёл ничего), но Слой 4 (extract_availability, свой
+    отдельный LLM-вызов с той же схемой ответа) её всё-таки нашёл — эта
+    цена не должна теряться, company.price обязан подхватить её как
+    резерв."""
+
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="ООО Без цены в тексте",
+                description_raw="смазка",
+                website="https://x.example",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    # Текст без единого совпадения PRICE_RE — никаких чисел с валютой.
+    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: "смазка в наличии, отличное качество")
+
+    def fake_extract_availability(product_description, site_text, source_url, units=None):
+        return Availability(
+            status=AvailabilityStatus.IN_STOCK,
+            quantity=None,
+            pack_size=None,
+            min_order=None,
+            lead_time_days=None,
+            price="73 800 ₽",
+            source_url=source_url,
+            checked_at=datetime.now(),
+            evidence="в наличии",
+        )
+
+    monkeypatch.setattr(pipeline, "extract_product_availability", fake_extract_availability)
+
+    companies = search_and_score(
+        "смазка", deep_relevance=True, relevance_llm_check=False, check_availability=True
+    )
+
+    assert companies[0].price is not None
+    assert companies[0].price.value == "73 800 ₽"
+    assert "Слой 4" in companies[0].price.source
+
+
+# --- probe_stepper (пилот, см. stepper_probe.py) — браузер замокан, сама
+# механика клика/DOM протестирована в test_stepper_probe.py (реальный
+# Playwright-прогон против локальной заглушки). Здесь — только проводка
+# через pipeline.py: когда пробинг запускается, как влияет на вердикт. ---
+
+
+class _StubPlaywrightHandle:
+    """Заглушка для (playwright_ctx, browser) — _refine_relevance безусловно
+    зовёт browser.close()/playwright_ctx.stop() в finally, реальный
+    Playwright здесь не нужен, сама механика клика тестируется в
+    test_stepper_probe.py."""
+
+    def close(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+def _fake_open_browser():
+    return _StubPlaywrightHandle(), _StubPlaywrightHandle()
+
+
+def test_probe_stepper_upgrades_unclear_verdict_to_enough(monkeypatch):
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="ООО Степпер",
+                description_raw="смазка",
+                website="https://x.example",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: "смазка, в наличии")
+    monkeypatch.setattr(
+        pipeline,
+        "extract_product_availability",
+        lambda product_description, site_text, source_url, units=None: Availability(
+            status=AvailabilityStatus.IN_STOCK,
+            quantity=None,
+            pack_size=None,
+            min_order=None,
+            lead_time_days=None,
+            price=None,
+            source_url=source_url,
+            checked_at=datetime.now(),
+            evidence="в наличии",
+        ),
+    )
+    monkeypatch.setattr(pipeline, "open_browser", _fake_open_browser)
+    monkeypatch.setattr(
+        pipeline,
+        "probe_max_orderable_quantity",
+        lambda url, target_qty, browser=None, product_description=None: StepperProbeResult(
+            target_confirmed=True, max_orderable=None, evidence=None
+        ),
+    )
+
+    companies = search_and_score(
+        "смазка 5 шт", deep_relevance=True, check_availability=True, probe_stepper=True
+    )
+
+    assert companies[0].availability_verdict == Verdict.ENOUGH.value
+    assert "интерактивной проверкой" in companies[0].availability_verdict_text
+
+
+def test_probe_stepper_sets_not_enough_with_discovered_max(monkeypatch):
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="ООО Степпер",
+                description_raw="смазка",
+                website="https://x.example",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: "смазка, в наличии")
+    monkeypatch.setattr(
+        pipeline,
+        "extract_product_availability",
+        lambda product_description, site_text, source_url, units=None: Availability(
+            status=AvailabilityStatus.IN_STOCK,
+            quantity=None,
+            pack_size=None,
+            min_order=None,
+            lead_time_days=None,
+            price=None,
+            source_url=source_url,
+            checked_at=datetime.now(),
+            evidence="в наличии",
+        ),
+    )
+    monkeypatch.setattr(pipeline, "open_browser", _fake_open_browser)
+    monkeypatch.setattr(
+        pipeline,
+        "probe_max_orderable_quantity",
+        lambda url, target_qty, browser=None, product_description=None: StepperProbeResult(
+            target_confirmed=False, max_orderable=8.0, evidence="Доступно только 8 шт"
+        ),
+    )
+
+    companies = search_and_score(
+        "смазка 20 шт", deep_relevance=True, check_availability=True, probe_stepper=True
+    )
+
+    assert companies[0].availability_verdict == Verdict.NOT_ENOUGH.value
+    assert "8" in companies[0].availability_verdict_text
+    assert "Доступно только 8 шт" in companies[0].availability_verdict_text
+
+
+def test_probe_stepper_skips_already_confident_enough_verdict(monkeypatch):
+    """Пробинг не должен тратить браузер там, где Слой 4 уже дал уверенный
+    ENOUGH — probe_max_orderable_quantity не должна вызываться вовсе."""
+
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="ООО Степпер",
+                description_raw="смазка",
+                website="https://x.example",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: "смазка, в наличии: 50 шт")
+    monkeypatch.setattr(
+        pipeline,
+        "extract_product_availability",
+        lambda product_description, site_text, source_url, units=None: Availability(
+            status=AvailabilityStatus.IN_STOCK_QTY,
+            quantity=Quantity(50.0, "шт", "50 шт"),
+            pack_size=None,
+            min_order=None,
+            lead_time_days=None,
+            price=None,
+            source_url=source_url,
+            checked_at=datetime.now(),
+            evidence="в наличии: 50 шт",
+        ),
+    )
+    monkeypatch.setattr(pipeline, "open_browser", _fake_open_browser)
+    probe_calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "probe_max_orderable_quantity",
+        lambda url, target_qty, browser=None, product_description=None: probe_calls.append(url) or StepperProbeResult(
+            target_confirmed=True, max_orderable=None, evidence=None
+        ),
+    )
+
+    companies = search_and_score(
+        "смазка 5 шт", deep_relevance=True, check_availability=True, probe_stepper=True
+    )
+
+    assert companies[0].availability_verdict == Verdict.ENOUGH.value  # уже был ENOUGH и без пробинга
+    assert probe_calls == []
+
+
+def test_probe_stepper_requires_check_availability(monkeypatch):
+    """probe_stepper=True без check_availability=True — no-op с
+    предупреждением, open_browser не должна вызываться вовсе."""
+
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="ООО Степпер",
+                description_raw="смазка",
+                website="https://x.example",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: "смазка, в наличии")
+    open_browser_calls = []
+    monkeypatch.setattr(
+        pipeline, "open_browser", lambda: (open_browser_calls.append(1), (object(), object()))[1]
+    )
+
+    companies = search_and_score(
+        "смазка 5 шт", deep_relevance=True, check_availability=False, probe_stepper=True
+    )
+
+    assert open_browser_calls == []
+    assert companies[0].availability is None
+
+
+def test_probe_stepper_missing_playwright_is_noop(monkeypatch):
+    """Пакет playwright не установлен (ImportError из open_browser) —
+    пайплайн не падает, просто пропускает пробинг, вердикт Слоя 4 остаётся
+    как есть."""
+
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="ООО Степпер",
+                description_raw="смазка",
+                website="https://x.example",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: "смазка, в наличии")
+    monkeypatch.setattr(
+        pipeline,
+        "extract_product_availability",
+        lambda product_description, site_text, source_url, units=None: Availability(
+            status=AvailabilityStatus.IN_STOCK,
+            quantity=None,
+            pack_size=None,
+            min_order=None,
+            lead_time_days=None,
+            price=None,
+            source_url=source_url,
+            checked_at=datetime.now(),
+            evidence="в наличии",
+        ),
+    )
+
+    def raise_import_error():
+        raise ImportError("playwright не установлен")
+
+    monkeypatch.setattr(pipeline, "open_browser", raise_import_error)
+
+    companies = search_and_score(
+        "смазка 5 шт", deep_relevance=True, check_availability=True, probe_stepper=True
+    )
+
+    # status=in_stock без числа -> IN_STOCK_NO_QTY (Слой 4), как и было —
+    # пробинг не смог запуститься (playwright не установлен) и не тронул вердикт.
+    assert companies[0].availability_verdict == Verdict.IN_STOCK_NO_QTY.value
+
+
+def test_ranking_key_sorts_by_availability_verdict_at_equal_score(monkeypatch):
+    """Внутри РОВНО одинакового score.total (и без цены) — приоритет по
+    quantity_match.VERDICT_SORT_ORDER: ENOUGH выше NOT_ENOUGH выше "нет
+    данных" (design-обсуждение: частичный остаток — более действенная
+    зацепка для байера, чем полное отсутствие данных об остатке)."""
+
+    def _company(name: str, verdict: Verdict | None) -> Company:
+        company = Company(
+            inn=None,
+            ogrn=None,
+            name=FieldValue(name, "test", date(2026, 1, 1)),
+            status="неизвестно",
+        )
+        company.score = ScoreBreakdown(relevance=0.5, trust=0.5, confidence=0.5, total=0.5)
+        company.availability_verdict = verdict.value if verdict else None
+        return company
+
+    companies = [
+        _company("Нет данных", Verdict.UNKNOWN),
+        _company("Достаточно", Verdict.ENOUGH),
+        _company("Недостаточно", Verdict.NOT_ENOUGH),
+    ]
+    companies.sort(key=lambda c: pipeline._ranking_key(c, marketplace_domains=[]))
+
+    assert [c.name.value for c in companies] == ["Достаточно", "Недостаточно", "Нет данных"]
+
+
+def test_ranking_key_price_beats_availability_verdict(monkeypatch):
+    """Явный запрос пользователя после разбора живой выдачи: цена — ГЛАВНЫЙ
+    критерий сортировки, приоритет по наличию — только внутри одинаковой
+    цены (см. _ranking_key). Более дешёвый кандидат с UNKNOWN должен
+    обгонять более дорогого с ENOUGH — обратное уже пробовалось и было
+    откачено (см. докстринг _ranking_key), потому что у большинства
+    категорий товара остаток на сайте не публикуется почти никогда, и
+    "приоритет наличия выше цены" на практике означал "почти всегда выше
+    цены" не по содержательной причине."""
+
+    def _company(name: str, verdict: Verdict, price_value: str, score_total: float) -> Company:
+        company = Company(
+            inn=None,
+            ogrn=None,
+            name=FieldValue(name, "test", date(2026, 1, 1)),
+            status="неизвестно",
+        )
+        company.score = ScoreBreakdown(
+            relevance=score_total, trust=0.5, confidence=0.5, total=score_total
+        )
+        company.availability_verdict = verdict.value
+        company.price = FieldValue(price_value, "test", date(2026, 1, 1))
+        return company
+
+    cheap_but_unknown = _company("Дешёвый, но неизвестно сколько", Verdict.UNKNOWN, "218 руб.", 0.90)
+    expensive_but_enough = _company("Дороже, но точно хватит", Verdict.ENOUGH, "5000 руб.", 0.30)
+
+    companies = [expensive_but_enough, cheap_but_unknown]
+    companies.sort(key=lambda c: pipeline._ranking_key(c, marketplace_domains=[]))
+
+    assert [c.name.value for c in companies] == ["Дешёвый, но неизвестно сколько", "Дороже, но точно хватит"]
+
+
+def test_ranking_key_availability_verdict_breaks_ties_within_equal_price(monkeypatch):
+    """Внутри ОДИНАКОВОЙ цены (частый случай для одной и той же позиции у
+    разных поставщиков) вердикт наличия всё ещё решает — цена главный
+    критерий, но не единственный."""
+
+    def _company(name: str, verdict: Verdict) -> Company:
+        company = Company(
+            inn=None, ogrn=None, name=FieldValue(name, "test", date(2026, 1, 1)), status="неизвестно"
+        )
+        company.score = ScoreBreakdown(relevance=0.5, trust=0.5, confidence=0.5, total=0.5)
+        company.availability_verdict = verdict.value
+        company.price = FieldValue("1000 руб.", "test", date(2026, 1, 1))
+        return company
+
+    companies = [_company("Нет данных", Verdict.UNKNOWN), _company("Достаточно", Verdict.ENOUGH)]
+    companies.sort(key=lambda c: pipeline._ranking_key(c, marketplace_domains=[]))
+
+    assert [c.name.value for c in companies] == ["Достаточно", "Нет данных"]
+
+
+def test_summarize_availability_reports_totals_and_single_supplier_coverage():
+    order_qty = Quantity(11.0, "шт", "11 шт")
+
+    def _company_with_qty(name: str, qty: float) -> Company:
+        company = Company(
+            inn=None, ogrn=None, name=FieldValue(name, "test", date(2026, 1, 1)), status="неизвестно"
+        )
+        company.availability = Availability(
+            status=AvailabilityStatus.IN_STOCK_QTY,
+            quantity=Quantity(qty, "шт", f"{qty:g} шт"),
+            pack_size=None,
+            min_order=None,
+            lead_time_days=None,
+            price=None,
+            source_url="https://x.example",
+            checked_at=datetime.now(),
+            evidence=None,
+        )
+        return company
+
+    companies = [_company_with_qty("Компания А", 15.0), _company_with_qty("Компания Б", 5.0)]
+
+    summary = pipeline.summarize_availability(companies, order_qty)
+
+    assert summary is not None
+    assert "Требуется: 11 шт" in summary
+    assert "20 шт" in summary and "2 поставщиков" in summary
+    assert "Компания А" in summary and "да" in summary
+
+
+def test_summarize_availability_returns_none_without_order_qty():
+    assert pipeline.summarize_availability([], None) is None

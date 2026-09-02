@@ -194,6 +194,32 @@ def test_confidence_reflects_filled_fields():
     assert compute_confidence(empty) == 0.0
 
 
+def test_confidence_counts_availability_presence_not_verdict_quality():
+    """company.availability присутствует -> поле чек-листа заполнено, даже
+    если сам вердикт UNKNOWN (LLM реально попыталась узнать остаток и
+    честно ответила "не опубликован") — штрафуется только полное
+    отсутствие попытки (availability=None), см. compute_confidence."""
+    from datetime import datetime
+
+    from procurement_search.models import Availability, AvailabilityStatus
+
+    without_check = _company("Без проверки наличия")
+    with_check = _company("С проверкой наличия")
+    with_check.availability = Availability(
+        status=AvailabilityStatus.UNKNOWN,
+        quantity=None,
+        pack_size=None,
+        min_order=None,
+        lead_time_days=None,
+        price=None,
+        source_url="https://example.com",
+        checked_at=datetime(2026, 8, 6),
+        evidence=None,
+    )
+
+    assert compute_confidence(with_check) > compute_confidence(without_check)
+
+
 def test_combine_score_zero_relevance_dominates_high_trust():
     # Мультипликативно: нулевая релевантность должна топить итог,
     # независимо от того, насколько высокий trust — это и была главная

@@ -63,6 +63,16 @@
     border-radius: 8px;
     font-size: 0.95rem;
   }
+  .add-form input[type="text"], .add-form select {
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.9rem;
+    background: var(--panel);
+    color: var(--text);
+  }
+  .add-form input[type="text"] { min-width: 160px; flex: 1; }
+  .add-form select { min-width: 220px; }
   .search-form label {
     font-size: 0.85rem;
     color: var(--muted);
@@ -104,6 +114,7 @@
   .badge.unverified { background: var(--unverified); color: var(--unverified-text); }
   .badge.stale { background: var(--stale); color: var(--stale-text); }
   .badge.not-checked { background: var(--not-checked); color: var(--not-checked-text); }
+  .badge.clarify { background: var(--unverified); color: var(--unverified-text); }
   .muted { color: var(--muted); }
   .score-total { font-weight: 700; }
   .table-wrap { overflow-x: auto; }
@@ -111,6 +122,34 @@
   a.download { color: var(--accent); text-decoration: none; font-weight: 600; }
   a.download:hover { text-decoration: underline; }
   .empty { color: var(--muted); font-size: 0.9rem; padding: 8px 0; }
+  .tree-category { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+  .tree-category-header {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--bg);
+    border: none;
+    cursor: pointer;
+    text-align: left;
+    font-size: 0.92rem;
+    color: var(--text);
+  }
+  .tree-category-header:hover { background: var(--border); }
+  .tree-category-chevron { transition: transform 0.15s ease; display: inline-block; color: var(--muted); }
+  .tree-category-header[aria-expanded="true"] .tree-category-chevron { transform: rotate(90deg); }
+  .tree-category-code { font-weight: 700; }
+  .tree-category-count {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 0.82rem;
+    background: var(--not-checked);
+    padding: 2px 9px;
+    border-radius: 999px;
+  }
+  .tree-category-body { display: none; padding: 0 4px; }
+  .tree-category-body.open { display: block; }
 </style>
 </head>
 <body>
@@ -128,6 +167,8 @@
       <label><input type="checkbox" id="deep-relevance"> Слой 2: краулить сайты кандидатов, находить цену и сортировать по ней (медленнее, точнее)</label>
       <label><input type="checkbox" id="relevance-llm-check"> LLM-фильтр: статьи/видео сразу; соответствие товара, характеристик и наличие товара — вместе со Слоем 2</label>
       <label><input type="checkbox" id="use-trusted-suppliers"> Сначала искать среди проверенных поставщиков категории, потом — глобальный поиск (нужен YANDEX_FM_API_KEY)</label>
+      <label><input type="checkbox" id="check-availability"> Слой 4: проверять остаток и сравнивать с запрошенным количеством (требует Слой 2 и YANDEX_FM_API_KEY, дороже LLM-фильтра)</label>
+      <label><input type="checkbox" id="probe-stepper"> ПИЛОТ: кликать степпер количества на странице (headless-браузер, требует Слой 4 и `playwright install chromium` на сервере, заметно медленнее — эвристика, не гарантия)</label>
       <button type="submit" id="submit-btn">Найти</button>
     </form>
     <div id="status"></div>
@@ -135,6 +176,7 @@
 
   <section class="panel" id="results-panel" style="display:none">
     <h2>Результаты <span id="results-meta" class="muted"></span></h2>
+    <div id="availability-summary" class="muted" style="display:none; white-space:pre-line; margin-bottom:12px;"></div>
     <div class="table-wrap">
       <table id="results-table">
         <thead>
@@ -146,6 +188,8 @@
             <th>Сайт</th>
             <th>Источники</th>
             <th>Наличие товара</th>
+            <th>Запрошено</th>
+            <th>Сравнение с заказом</th>
             <th>Цена</th>
             <th>Relevance</th>
             <th>Trust</th>
@@ -175,6 +219,24 @@
     </div>
     <div class="empty" id="reports-empty" style="display:none">Пока нет ни одного отчёта.</div>
   </section>
+
+  <section class="panel">
+    <h2>БД доверенных поставщиков <span class="muted">— заполняется автоматически при поиске с включённым «Сначала искать среди проверенных поставщиков», либо добавляется вручную ниже</span></h2>
+    <button type="button" class="secondary" id="add-trusted-toggle">+ Добавить поставщика вручную</button>
+    <form class="search-form add-form" id="add-trusted-form" style="display:none; margin-top:12px;">
+      <select id="add-trusted-category" required></select>
+      <input type="text" id="add-trusted-domain" placeholder="Домен, например huterrussia.ru" required>
+      <input type="text" id="add-trusted-name" placeholder="Название компании" required>
+      <input type="text" id="add-trusted-phone" placeholder="Телефон (необязательно)">
+      <input type="text" id="add-trusted-email" placeholder="Email (необязательно)">
+      <input type="text" id="add-trusted-address" placeholder="Адрес (необязательно)">
+      <input type="text" id="add-trusted-inn" placeholder="ИНН (необязательно)">
+      <button type="submit">Добавить</button>
+    </form>
+    <div id="add-trusted-status" class="muted" style="min-height:1.2em;"></div>
+    <div id="trusted-tree"></div>
+    <div class="empty" id="trusted-empty" style="display:none">База пока пуста.</div>
+  </section>
 </main>
 
 <script>
@@ -186,6 +248,16 @@ const resultsMeta = document.getElementById('results-meta');
 const resultsBody = document.querySelector('#results-table tbody');
 const reportsBody = document.querySelector('#reports-table tbody');
 const reportsEmpty = document.getElementById('reports-empty');
+const trustedTree = document.getElementById('trusted-tree');
+const trustedEmpty = document.getElementById('trusted-empty');
+// Какие категории сейчас развёрнуты (по category_code) — переживает
+// перезагрузку дерева (например, после поиска или удаления записи), не
+// нужно раскрывать заново каждый раз.
+const expandedCategories = new Set();
+const addTrustedToggle = document.getElementById('add-trusted-toggle');
+const addTrustedForm = document.getElementById('add-trusted-form');
+const addTrustedCategory = document.getElementById('add-trusted-category');
+const addTrustedStatus = document.getElementById('add-trusted-status');
 
 function badge(confidence) {
   const map = {
@@ -211,6 +283,7 @@ function websiteCell(field) {
 function stockBadge(stockStatus) {
   const map = {
     'в наличии': 'confirmed',
+    'уточнить наличие': 'clarify',
     'нет в наличии': 'stale',
     'не проверено': 'not-checked',
   };
@@ -218,8 +291,38 @@ function stockBadge(stockStatus) {
   return `<span class="badge ${cls}">${stockStatus || 'не проверено'}</span>`;
 }
 
-function renderResults(companies) {
+function stockCell(stockStatus, quote) {
+  const badge = stockBadge(stockStatus);
+  if (!quote) return badge;
+  return `${badge}<br><span class="muted">«${quote}»</span>`;
+}
+
+// Слой 4 (см. quantity_match.Verdict) — отдельная от stockBadge палитра:
+// достаточно/недостаточно — не то же самое, что "в наличии"/"нет в
+// наличии" (models.StockStatus), обе проверки работают параллельно.
+function availabilityBadgeClass(verdict) {
+  const map = {
+    'достаточно': 'confirmed',
+    'недостаточно': 'clarify',
+    'под_заказ': 'clarify',
+    'в_наличии_количество_не_указано': 'not-checked',
+    'единицы_не_сопоставимы': 'not-checked',
+    'нет_данных': 'not-checked',
+    'нет_в_наличии': 'stale',
+  };
+  return map[verdict] || 'not-checked';
+}
+
+function availabilityCell(c) {
+  // availability_verdict_text уже готовый текст с сервера (quantity_match.compare) —
+  // не переформатируем на клиенте, только оборачиваем в цветной бейдж.
+  if (!c.availability_verdict_text) return '<span class="muted">—</span>';
+  return `<span class="badge ${availabilityBadgeClass(c.availability_verdict)}">${c.availability_verdict_text}</span>`;
+}
+
+function renderResults(companies, requiredQuantity) {
   resultsBody.innerHTML = '';
+  const requestedCell = requiredQuantity ? requiredQuantity : '<span class="muted">—</span>';
   for (const c of companies) {
     const tr = document.createElement('tr');
     const score = c.score ? c.score.total.toFixed(3) : '—';
@@ -233,7 +336,9 @@ function renderResults(companies) {
       <td>${fieldCell(c.address)}</td>
       <td>${websiteCell(c.website)}</td>
       <td>${c.sources.join(', ')}</td>
-      <td>${stockBadge(c.stock_status)}</td>
+      <td>${stockCell(c.stock_status, c.stock_status_quote)}</td>
+      <td>${requestedCell}</td>
+      <td>${availabilityCell(c)}</td>
       <td>${c.price ? c.price.value : '<span class="muted">—</span>'}</td>
       <td>${relevance}</td>
       <td>${trust}</td>
@@ -262,6 +367,158 @@ async function loadReports() {
   }
 }
 
+function trustedSupplierRowHtml(s) {
+  return `
+    <tr>
+      <td>${s.domain}</td>
+      <td>${s.name}</td>
+      <td>${s.best_rank != null ? s.best_rank : '—'}</td>
+      <td>${s.times_recorded}</td>
+      <td>${s.phone || '<span class="muted">—</span>'}</td>
+      <td>${s.email || '<span class="muted">—</span>'}</td>
+      <td class="muted">${s.last_seen}</td>
+      <td><button type="button" class="secondary" data-delete-domain="${s.domain}">Удалить</button></td>
+    </tr>
+  `;
+}
+
+function trustedCategoryNodeHtml(group) {
+  const isOpen = expandedCategories.has(group.category_code);
+  return `
+    <div class="tree-category" data-category="${group.category_code}">
+      <button type="button" class="tree-category-header" aria-expanded="${isOpen}">
+        <span class="tree-category-chevron">&#9656;</span>
+        <span class="tree-category-code">${group.category_code}</span>
+        <span>${group.category_name}</span>
+        <span class="tree-category-count">${group.suppliers.length}</span>
+      </button>
+      <div class="tree-category-body ${isOpen ? 'open' : ''}">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Домен</th>
+                <th>Название</th>
+                <th>Ранг</th>
+                <th>Раз встречался</th>
+                <th>Телефон</th>
+                <th>Email</th>
+                <th>Обновлён</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>${group.suppliers.map(trustedSupplierRowHtml).join('')}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function loadTrustedSuppliers() {
+  const resp = await fetch('/api/trusted-suppliers');
+  const groups = await resp.json();
+  trustedEmpty.style.display = groups.length ? 'none' : '';
+  trustedTree.innerHTML = groups.map(trustedCategoryNodeHtml).join('');
+}
+
+// Делегирование клика на всё дерево — узлы категорий и строки создаются
+// динамически при каждой перезагрузке, вешать обработчики по отдельности
+// на каждый элемент не нужно.
+trustedTree.addEventListener('click', async (e) => {
+  const header = e.target.closest('.tree-category-header');
+  if (header) {
+    const categoryCode = header.closest('.tree-category').dataset.category;
+    const body = header.nextElementSibling;
+    const nowOpen = !body.classList.contains('open');
+    body.classList.toggle('open', nowOpen);
+    header.setAttribute('aria-expanded', String(nowOpen));
+    if (nowOpen) {
+      expandedCategories.add(categoryCode);
+    } else {
+      expandedCategories.delete(categoryCode);
+    }
+    return;
+  }
+
+  const btn = e.target.closest('button[data-delete-domain]');
+  if (!btn) return;
+  const domain = btn.dataset.deleteDomain;
+  if (!confirm(`Удалить ${domain} из базы доверенных поставщиков? Это действие необратимо.`)) return;
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`/api/trusted-suppliers/${encodeURIComponent(domain)}`, { method: 'DELETE' });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `Ошибка ${resp.status}`);
+    }
+    await loadTrustedSuppliers();
+  } catch (err) {
+    alert('Не удалось удалить: ' + err.message);
+    btn.disabled = false;
+  }
+});
+
+async function loadCategoriesIntoSelect() {
+  const resp = await fetch('/api/categories');
+  const categories = await resp.json();
+  addTrustedCategory.innerHTML = categories
+    .map((c) => `<option value="${c.code}">${c.code} — ${c.name}</option>`)
+    .join('');
+}
+
+addTrustedToggle.addEventListener('click', () => {
+  const nowVisible = addTrustedForm.style.display === 'none';
+  addTrustedForm.style.display = nowVisible ? '' : 'none';
+  addTrustedToggle.textContent = nowVisible ? 'Скрыть форму' : '+ Добавить поставщика вручную';
+});
+
+addTrustedForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const domain = document.getElementById('add-trusted-domain').value.trim();
+  const name = document.getElementById('add-trusted-name').value.trim();
+  const categoryCode = addTrustedCategory.value;
+  const phone = document.getElementById('add-trusted-phone').value.trim();
+  const email = document.getElementById('add-trusted-email').value.trim();
+  const address = document.getElementById('add-trusted-address').value.trim();
+  const inn = document.getElementById('add-trusted-inn').value.trim();
+  if (!domain || !name) return;
+
+  addTrustedStatus.className = 'muted';
+  addTrustedStatus.textContent = 'Добавляем…';
+  try {
+    const resp = await fetch('/api/trusted-suppliers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        domain,
+        name,
+        category_code: categoryCode,
+        phone: phone || null,
+        email: email || null,
+        address: address || null,
+        inn: inn || null,
+      }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `Ошибка ${resp.status}`);
+    }
+    const result = await resp.json();
+    addTrustedStatus.textContent = `Добавлено: ${result.domain} → ${categoryCode}`;
+    addTrustedForm.reset();
+    addTrustedForm.style.display = 'none';
+    addTrustedToggle.textContent = '+ Добавить поставщика вручную';
+    // Сразу разворачиваем категорию, куда добавили — иначе байер не
+    // увидит результат без лишнего клика по свёрнутому узлу.
+    expandedCategories.add(result.category_code);
+    await loadTrustedSuppliers();
+  } catch (err) {
+    addTrustedStatus.className = 'error';
+    addTrustedStatus.textContent = 'Ошибка: ' + err.message;
+  }
+});
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const query = document.getElementById('query').value.trim();
@@ -270,10 +527,14 @@ form.addEventListener('submit', async (e) => {
   const deepRelevance = document.getElementById('deep-relevance').checked;
   const relevanceLlmCheck = document.getElementById('relevance-llm-check').checked;
   const useTrustedSuppliers = document.getElementById('use-trusted-suppliers').checked;
+  const checkAvailability = document.getElementById('check-availability').checked;
+  const probeStepper = document.getElementById('probe-stepper').checked;
 
   submitBtn.disabled = true;
   statusEl.className = '';
-  statusEl.textContent = deepRelevance
+  statusEl.textContent = probeStepper
+    ? 'Идёт поиск, краулинг и интерактивная проверка степперов в браузере — это может занять заметно дольше…'
+    : deepRelevance
     ? 'Идёт поиск и краулинг сайтов кандидатов — это может занять несколько минут…'
     : 'Идёт поиск…';
   resultsPanel.style.display = 'none';
@@ -288,6 +549,8 @@ form.addEventListener('submit', async (e) => {
         deep_relevance: deepRelevance,
         relevance_llm_check: relevanceLlmCheck,
         use_trusted_suppliers: useTrustedSuppliers,
+        check_availability: checkAvailability,
+        probe_stepper: probeStepper,
       }),
     });
     if (!resp.ok) {
@@ -297,8 +560,20 @@ form.addEventListener('submit', async (e) => {
     const data = await resp.json();
     statusEl.textContent = `Готово: найдено ${data.companies.length} компаний.`;
     resultsMeta.textContent = `— «${data.report.query}»`;
-    renderResults(data.companies);
+    const summaryEl = document.getElementById('availability-summary');
+    if (data.availability_summary) {
+      summaryEl.textContent = data.availability_summary;
+      summaryEl.style.display = '';
+    } else {
+      summaryEl.style.display = 'none';
+    }
+    renderResults(data.companies, data.required_quantity);
     await loadReports();
+    // Поиск с use_trusted_suppliers мог дописать новые домены в базу
+    // (см. pipeline._write_back_trusted_suppliers) — обновляем таблицу,
+    // даже если галочка не стояла: безвредный лишний fetch, зато таблица
+    // никогда не показывает устаревшие данные после поиска.
+    await loadTrustedSuppliers();
   } catch (err) {
     statusEl.className = 'error';
     statusEl.textContent = 'Ошибка: ' + err.message;
@@ -308,6 +583,8 @@ form.addEventListener('submit', async (e) => {
 });
 
 loadReports();
+loadTrustedSuppliers();
+loadCategoriesIntoSelect();
 </script>
 </body>
 </html>

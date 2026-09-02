@@ -98,7 +98,7 @@ _DEFAULT_SCORE_WEIGHTS = {
 # "глубина проработки нестабильна — где-то только название, где-то контакты
 # и контактное лицо"). Порядок не важен — важно только количество и то, что
 # каждое поле реально отражает то, что байеру нужно в карточке.
-_CONFIDENCE_FIELDS = 10
+_CONFIDENCE_FIELDS = 11
 
 
 def _tokenize(text: str) -> set[str]:
@@ -255,7 +255,16 @@ def compute_confidence(company: Company) -> float:
     """Чек-лист заполненности карточки — прямой ответ на ТЗ п.4
     ("глубина проработки нестабильна"). Не влияет на relevance/trust,
     показывается байеру отдельно (export.py), чтобы не путать "плохой
-    поставщик" и "мало о нём известно" — см. докстринг модуля."""
+    поставщик" и "мало о нём известно" — см. докстринг модуля.
+
+    company.availability is not None — присутствие ПРОВЕРКИ (Слой 4, см.
+    pipeline.py check_availability), а не качество её результата:
+    availability.status == UNKNOWN при реально отработавшем LLM-вызове
+    всё равно засчитывается как "поле заполнено" (мы честно попытались
+    узнать остаток и получили содержательный ответ "не опубликован"),
+    штрафуется только полное отсутствие попытки (флаг выключен, кандидат
+    не попал в top-N, или сайт не отдал текст — company.availability
+    остаётся None) — тот же принцип, что и у остальных полей чек-листа."""
     filled = [
         company.inn is not None,
         bool(company.contacts.get("phone")),
@@ -267,6 +276,7 @@ def compute_confidence(company: Company) -> float:
         company.years_in_business is not None,
         bool(company.revenue_last_2y),
         company.status != "неизвестно",
+        company.availability is not None,
     ]
     assert len(filled) == _CONFIDENCE_FIELDS
     return sum(filled) / _CONFIDENCE_FIELDS
@@ -402,3 +412,5 @@ def compute_score(
     total = combine_score(relevance, trust, confidence, w)
 
     return ScoreBreakdown(relevance=relevance, trust=trust, confidence=confidence, total=total)
+
+

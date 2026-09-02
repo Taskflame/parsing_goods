@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from procurement_search import pipeline, webapp
 from procurement_search.models import Candidate, VerificationFlag
+from procurement_search.trusted_suppliers import TrustedSupplierStore
 
 
 class _FakeSource:
@@ -92,6 +93,23 @@ def test_download_rejects_path_traversal(monkeypatch, tmp_path):
     assert resp.status_code == 404
 
 
+def test_search_reports_required_quantity_and_availability_summary(monkeypatch, tmp_path):
+    """check_availability=False (по умолчанию) — required_quantity/
+    availability_summary всё равно вычисляются из Слоя 0.6 (order_qty
+    распознаётся детерминированно, без LLM), а сама сводка по остаткам —
+    None, потому что ни у одной компании ещё нет company.availability."""
+    client = _client(monkeypatch, tmp_path)
+
+    resp = client.post("/api/search", json={"query": "цинкование 11 шт"})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["required_quantity"] == "11 шт"
+    assert data["availability_summary"] is None
+    assert data["companies"][0]["availability"] is None
+    assert data["companies"][0]["availability_verdict"] is None
+
+
 def test_search_includes_website_liveness_field(monkeypatch, tmp_path):
     def fake_candidates_with_website(query: str) -> list[Candidate]:
         return [
@@ -117,3 +135,143 @@ def test_search_includes_website_liveness_field(monkeypatch, tmp_path):
     website = resp.json()["companies"][0]["website"]
     assert website["value"] == "https://galvanika.ru"
     assert website["confidence"] == "подтверждён"
+
+
+# --- /api/trusted-suppliers — просмотр + удаление БД доверенных поставщиков ---
+
+
+def test_list_trusted_suppliers_groups_by_category_with_readable_name(monkeypatch, tmp_path):
+    """Ответ сгруппирован по категории (см. TrustedSupplierStore.list_by_category)
+    — под древовидный UI, не плоский список — и обогащён человекочитаемым
+    category_name из config/categories.yaml (LLM/байер видят код "F3" не
+    напрямую, а с названием рядом)."""
+    from procurement_search.config import load_categories
+
+    db_path = tmp_path / "trusted.db"
+    monkeypatch.setattr(webapp, "TrustedSupplierStore", lambda *a, **k: TrustedSupplierStore(db_path))
+    with TrustedSupplierStore(db_path) as store:
+        store.record_supplier(
+            domain="huterrussia.ru", name="Huter", category_code="F3", rank=1, source_query="q"
+        )
+        store.record_supplier(
+            domain="clasta.ru", name="Clasta", category_code="E1", rank=1, source_query="q"
+        )
+
+    client = TestClient(webapp.app)
+    resp = client.get("/api/trusted-suppliers")
+
+    assert resp.status_code == 200
+    groups = resp.json()
+    assert [g["category_code"] for g in groups] == ["E1", "F3"]
+
+    real_names = load_categories()
+    f3 = next(g for g in groups if g["category_code"] == "F3")
+    assert f3["category_name"] == real_names["F3"]["name"]
+    assert [s["domain"] for s in f3["suppliers"]] == ["huterrussia.ru"]
+
+
+def test_list_trusted_suppliers_empty_when_nothing_recorded(monkeypatch, tmp_path):
+    db_path = tmp_path / "trusted.db"
+    monkeypatch.setattr(webapp, "TrustedSupplierStore", lambda *a, **k: TrustedSupplierStore(db_path))
+
+    client = TestClient(webapp.app)
+    resp = client.get("/api/trusted-suppliers")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_delete_trusted_supplier_removes_it(monkeypatch, tmp_path):
+    db_path = tmp_path / "trusted.db"
+    monkeypatch.setattr(webapp, "TrustedSupplierStore", lambda *a, **k: TrustedSupplierStore(db_path))
+    with TrustedSupplierStore(db_path) as store:
+        store.record_supplier(
+            domain="junk.example", name="Junk", category_code="F3", rank=1, source_query="q"
+        )
+
+    client = TestClient(webapp.app)
+    resp = client.delete("/api/trusted-suppliers/junk.example")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": "junk.example"}
+    with TrustedSupplierStore(db_path) as store:
+        assert store.get_supplier("junk.example") is None
+
+
+def test_delete_trusted_supplier_unknown_domain_returns_404(monkeypatch, tmp_path):
+    db_path = tmp_path / "trusted.db"
+    monkeypatch.setattr(webapp, "TrustedSupplierStore", lambda *a, **k: TrustedSupplierStore(db_path))
+
+    client = TestClient(webapp.app)
+    resp = client.delete("/api/trusted-suppliers/unknown.example")
+
+    assert resp.status_code == 404
+
+
+def test_list_categories_returns_full_reference_including_empty_ones(monkeypatch, tmp_path):
+    """В отличие от /api/trusted-suppliers (только категории с данными),
+    /api/categories отдаёт ВЕСЬ справочник — иначе байер не смог бы
+    вручную завести первого поставщика в ещё пустую категорию."""
+    from procurement_search.config import load_categories
+
+    client = TestClient(webapp.app)
+    resp = client.get("/api/categories")
+
+    assert resp.status_code == 200
+    rows = resp.json()
+    real_categories = load_categories()
+    assert len(rows) == len(real_categories)
+    assert {"code": "F3", "name": real_categories["F3"]["name"]} in rows
+
+
+def test_add_trusted_supplier_manually(monkeypatch, tmp_path):
+    db_path = tmp_path / "trusted.db"
+    monkeypatch.setattr(webapp, "TrustedSupplierStore", lambda *a, **k: TrustedSupplierStore(db_path))
+
+    client = TestClient(webapp.app)
+    resp = client.post(
+        "/api/trusted-suppliers",
+        json={
+            "domain": "https://www.huterrussia.ru/catalog",
+            "name": "Huter Russia",
+            "category_code": "F3",
+            "phone": "+7 900 000 00 00",
+        },
+    )
+
+    assert resp.status_code == 200
+    # Схема/www/путь должны быть отрезаны при нормализации домена.
+    assert resp.json() == {"domain": "huterrussia.ru", "category_code": "F3"}
+
+    list_resp = client.get("/api/trusted-suppliers")
+    groups = list_resp.json()
+    f3 = next(g for g in groups if g["category_code"] == "F3")
+    assert f3["suppliers"][0]["domain"] == "huterrussia.ru"
+    assert f3["suppliers"][0]["phone"] == "+7 900 000 00 00"
+    assert f3["suppliers"][0]["best_rank"] == 1
+
+
+def test_add_trusted_supplier_rejects_unknown_category(monkeypatch, tmp_path):
+    db_path = tmp_path / "trusted.db"
+    monkeypatch.setattr(webapp, "TrustedSupplierStore", lambda *a, **k: TrustedSupplierStore(db_path))
+
+    client = TestClient(webapp.app)
+    resp = client.post(
+        "/api/trusted-suppliers",
+        json={"domain": "example.ru", "name": "Тест", "category_code": "НЕСУЩЕСТВУЮЩАЯ"},
+    )
+
+    assert resp.status_code == 400
+
+
+def test_add_trusted_supplier_rejects_empty_domain_or_name(monkeypatch, tmp_path):
+    db_path = tmp_path / "trusted.db"
+    monkeypatch.setattr(webapp, "TrustedSupplierStore", lambda *a, **k: TrustedSupplierStore(db_path))
+
+    client = TestClient(webapp.app)
+    resp = client.post(
+        "/api/trusted-suppliers",
+        json={"domain": "   ", "name": "Тест", "category_code": "F3"},
+    )
+
+    assert resp.status_code == 400

@@ -156,10 +156,12 @@ def test_classify_listing_type_survives_api_error(monkeypatch):
     assert result is None
 
 
-def test_classify_stock_status_returns_true_on_explicit_badge(monkeypatch):
+def test_classify_stock_status_returns_out_of_stock_on_explicit_badge(monkeypatch):
     def fake_classify(site_text, **kwargs):
         assert "Товар закончился" in site_text
-        return StockVerdict(out_of_stock=True, reasoning="плашка 'товар закончился' на странице")
+        return StockVerdict(
+            status="out_of_stock", quote="Товар закончился", reasoning="плашка на странице"
+        )
 
     monkeypatch.setattr(
         "procurement_search.yandexgpt_classifier.classify_stock_status_with_yandexgpt", fake_classify
@@ -167,12 +169,27 @@ def test_classify_stock_status_returns_true_on_explicit_badge(monkeypatch):
 
     result = classify_stock_status("Насос дренажный. Товар закончился.")
 
-    assert result is True
+    assert result == ("out_of_stock", "Товар закончился")
 
 
-def test_classify_stock_status_returns_false_without_badge(monkeypatch):
+def test_classify_stock_status_returns_clarify_on_ambiguous_wording(monkeypatch):
     def fake_classify(site_text, **kwargs):
-        return StockVerdict(out_of_stock=False, reasoning="явного маркера нет")
+        return StockVerdict(
+            status="clarify", quote="цена уточняется у менеджера", reasoning="нет прямого ответа"
+        )
+
+    monkeypatch.setattr(
+        "procurement_search.yandexgpt_classifier.classify_stock_status_with_yandexgpt", fake_classify
+    )
+
+    result = classify_stock_status("Насос дренажный. Цена уточняется у менеджера.")
+
+    assert result == ("clarify", "цена уточняется у менеджера")
+
+
+def test_classify_stock_status_returns_in_stock_without_badge(monkeypatch):
+    def fake_classify(site_text, **kwargs):
+        return StockVerdict(status="in_stock", quote=None, reasoning="явного маркера нет")
 
     monkeypatch.setattr(
         "procurement_search.yandexgpt_classifier.classify_stock_status_with_yandexgpt", fake_classify
@@ -180,7 +197,7 @@ def test_classify_stock_status_returns_false_without_badge(monkeypatch):
 
     result = classify_stock_status("Насос дренажный, в каталоге компании")
 
-    assert result is False
+    assert result == ("in_stock", None)
 
 
 def test_classify_stock_status_survives_api_error(monkeypatch):

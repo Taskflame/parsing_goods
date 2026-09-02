@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 
@@ -57,7 +59,8 @@ class CategoryGuess(BaseModel):
 
 
 class StockVerdict(BaseModel):
-    out_of_stock: bool
+    status: Literal["in_stock", "clarify", "out_of_stock"]
+    quote: str | None
     reasoning: str
 
 
@@ -65,4 +68,37 @@ class ContactGuess(BaseModel):
     phone: str | None
     email: str | None
     address: str | None
+    reasoning: str
+
+
+class AvailabilityGuess(BaseModel):
+    """См. availability.extract_availability. Плоские поля (не вложенные
+    объекты, как в исходной постановке задачи с "фасовка": {...}) — тот же
+    принцип, что и у остальных схем в этом файле: json_schema strict-режим
+    работает надёжнее с плоской структурой, вложенность не даёт здесь
+    ничего сверх нескольких дополнительных полей."""
+
+    is_product_page: bool
+    status: Literal["in_stock_qty", "in_stock", "on_order", "out_of_stock", "unknown"]
+    quantity: float | None
+    quantity_unit: str | None
+    pack_size_qty: float | None
+    pack_size_unit: str | None
+    min_order_qty: float | None
+    min_order_unit: str | None
+    lead_time_days: int | None
+    price: str | None
+    evidence: str | None
+    reasoning: str
+
+
+class ElementLocatorGuess(BaseModel):
+    """См. stepper_probe.py, третий (самый дорогой) шаг эвристики поиска
+    степпера — когда детерминированные селекторы и клик по типовой кнопке
+    "В корзину" не сработали. element_index — индекс в пронумерованном
+    списке кликабельных элементов страницы (см. промпт), который сама
+    модель посчитала кнопкой "+"/"добавить в корзину"; null, если ни один
+    элемент явно не подошёл — не угадываем наугад, честное "не нашли"."""
+
+    element_index: int | None
     reasoning: str

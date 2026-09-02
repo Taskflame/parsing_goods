@@ -36,3 +36,7 @@ def load_marketplace_domains() -> list[str]:
 
 def load_categories() -> dict[str, Any]:
     return _load_yaml("categories.yaml")
+
+
+def load_spec_ranges() -> dict[str, Any]:
+    return _load_yaml("spec_ranges.yaml")

@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 import re
 
+from procurement_search.llm_schemas import AvailabilityGuess
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,13 +76,18 @@ def check_attribute_match(raw_query: str, site_text: str) -> bool | None:
     return result.matches
 
 
-def classify_stock_status(site_text: str) -> bool | None:
-    """Слой 3, информационная проверка (см. models.StockStatus): True — на
-    сайте нашлась явная плашка "нет в наличии"/"товар закончился"/"распродано",
-    False — такого маркера не нашлось (не путать с "точно в наличии" — просто
-    нет сигнала об обратном). None — LLM недоступна/упала, вызывающий код
-    (pipeline._refine_relevance) должен трактовать это как "не проверено" —
-    как и остальной Слой 3, НЕ влияет на score, только на company.stock_status."""
+def classify_stock_status(site_text: str) -> tuple[str, str | None] | None:
+    """Слой 3, информационная проверка (см. models.StockStatus): определяет
+    статус наличия на тексте сайта — одну из трёх категорий ('in_stock' /
+    'clarify' / 'out_of_stock', см. yandexgpt_classifier.classify_stock_status_with_yandexgpt
+    про их точные критерии), плюс дословную цитату с сайта, подтверждающую
+    выбор (None, если статус выставлен по умолчанию — явного маркера не
+    нашлось).
+
+    Возвращает (status, quote). None целиком — LLM недоступна/упала,
+    вызывающий код (pipeline._refine_relevance) должен трактовать это как
+    "не проверено" — как и остальной Слой 3, НЕ влияет на score, только на
+    company.stock_status/stock_status_quote."""
     try:
         from procurement_search.yandexgpt_classifier import (
             classify_stock_status_with_yandexgpt as classify_fn,
@@ -94,7 +101,31 @@ def classify_stock_status(site_text: str) -> bool | None:
     except Exception:
         logger.warning("LLM-проверка наличия товара не сработала", exc_info=True)
         return None
-    return result.out_of_stock
+    return result.status, result.quote
+
+
+def extract_availability(product_description: str, site_text: str) -> AvailabilityGuess | None:
+    """Слой 4 (см. availability.extract_availability, models.Availability):
+    единственный LLM-вызов для определения остатка/фасовки/минимальной
+    партии/срока поставки — параллельно classify_stock_status выше, не
+    заменяет её (см. models.AvailabilityStatus про мотивацию оставить обе).
+
+    Возвращает llm_schemas.AvailabilityGuess. None — LLM недоступна/упала,
+    вызывающий код (availability.extract_availability) трактует это как
+    UNKNOWN, не выдумывая результат."""
+    try:
+        from procurement_search.yandexgpt_classifier import (
+            extract_availability_with_yandexgpt as extract_fn,
+        )
+    except ImportError:
+        logger.warning("Пакет openai не установлен — LLM-извлечение наличия товара пропущено")
+        return None
+
+    try:
+        return extract_fn(product_description, site_text)
+    except Exception:
+        logger.warning("LLM-извлечение наличия товара не сработало", exc_info=True)
+        return None
 
 
 def classify_listing_type(raw_query: str, title: str, snippet: str | None) -> bool | None:
