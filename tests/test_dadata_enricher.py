@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from procurement_search.enrichment import DadataEnricher
-from procurement_search.models import Candidate, VerificationFlag
+from procurement_search.models import ACTUAL_ADDRESS, Candidate, LEGAL_ADDRESS, VerificationFlag
 
 
 class _FakeResponse:
@@ -117,24 +117,34 @@ def test_survives_network_error_without_crashing():
     assert company.status == "неизвестно"
 
 
-def test_egrul_address_added_with_confirmed_flag_at_front():
+def test_egrul_address_added_with_confirmed_flag_and_legal_kind():
+    # Юридический адрес ЕГРЮЛ теперь дописывается в конец (append), а не в
+    # начало: фактический адрес со скрапинга остаётся первым (его и показывает
+    # превью), так как юридический и фактический адрес работы у одной компании
+    # могут не совпадать (у kazan.geogrunt.ru — юр.адрес в Барнауле, офис в
+    # Казани). Плюс ЕГРЮЛ-адрес помечается kind="юридический".
     session = _FakeSession(
         _FakeResponse(
-            {"suggestions": [_suggestion(status="ACTIVE", address="г. Москва, ул. Ленина, 1")]}
+            {"suggestions": [_suggestion(status="ACTIVE", address="г. Барнаул, ул. Ленина, 1")]}
         )
     )
     enricher = DadataEnricher(api_key="test-key", session=session)
 
     company = enricher.build_company(
-        [_cand(address_raw="Москва, Ленина 1 (со слов сайта)")]
+        [_cand(address_raw="г Казань, ул Кремлевская, 1 (офис)")]
     )
 
     addresses = company.contacts["address"]
     assert len(addresses) == 2
-    assert addresses[0].value == "г. Москва, ул. Ленина, 1"
-    assert addresses[0].confidence == VerificationFlag.CONFIRMED
-    assert addresses[1].value == "Москва, Ленина 1 (со слов сайта)"
-    assert addresses[1].confidence == VerificationFlag.UNVERIFIED
+    # фактический адрес со скрапинга — первый (его показывает превью)
+    assert addresses[0].value == "г Казань, ул Кремлевская, 1 (офис)"
+    assert addresses[0].confidence == VerificationFlag.UNVERIFIED
+    assert addresses[0].kind == ACTUAL_ADDRESS
+    # юридический адрес ЕГРЮЛ — второй, подтверждённый и помеченный как
+    # юридический (не должен подменять фактический адрес на превью)
+    assert addresses[1].value == "г. Барнаул, ул. Ленина, 1"
+    assert addresses[1].confidence == VerificationFlag.CONFIRMED
+    assert addresses[1].kind == LEGAL_ADDRESS
 
 
 def test_picks_suggestion_whose_address_matches_candidate():

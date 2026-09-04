@@ -75,6 +75,16 @@ class Availability:
     evidence: str | None  # дословный фрагмент страницы-обоснование, как у StockStatus.quote выше
 
 
+# Внутренняя классификация значения контактного поля. Пока используется только
+# для АДРЕСА, и только чтобы отделить юридический адрес из ЕГРЮЛ от фактического
+# адреса работы (design-обсуждение: у kazan.geogrunt.ru юр.адрес в Барнауле, а
+# офис в Казани — по юридическому адресу нельзя ни показывать как место работы,
+# ни жестко фильтровать по региону). None (по умолчанию) — классификация не
+# известна (пр.: адрес, вырванный регексом из сниппета поисковика).
+LEGAL_ADDRESS = "юридический"
+ACTUAL_ADDRESS = "фактический"
+
+
 @dataclass(frozen=True)
 class FieldValue:
     """Одно значение поля с происхождением — источник, дата, достоверность.
@@ -87,6 +97,9 @@ class FieldValue:
     source: str
     retrieved_at: date
     confidence: VerificationFlag = VerificationFlag.UNVERIFIED
+    # Классификация значения поля (см. LEGAL_ADDRESS/ACTUAL_ADDRESS выше).
+    # Только для адреса; у телефона/email/сайта всегда None.
+    kind: str | None = None
 
 
 @dataclass

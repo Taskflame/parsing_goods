@@ -1,0 +1,25 @@
+[Unit]
+Description=Procurement Search (parsing_goods) web GUI
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/procurement-ai
+Environment=PORT=8011
+Environment=PYTHONPATH=src
+# Host default in webapp.py is 127.0.0.1; nginx gateway (127.0.0.1:8092)
+# proxies to this listener. Keep on 127.0.0.1 unless you need external binds.
+Environment=HOST=127.0.0.1
+ExecStart=/srv/procurement-ai/.venv/bin/python3 -m procurement_search.webapp
+Restart=always
+RestartSec=3
+# Run as the owner of the repo so logs/data/reports keep the same perms.
+User=aiuser
+Group=aiuser
+
+# Logs from systemd's own output capture go to journald as well.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

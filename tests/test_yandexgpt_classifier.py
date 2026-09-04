@@ -11,6 +11,7 @@ from procurement_search.yandexgpt_classifier import (
     classify_listing_type_with_yandexgpt,
     classify_relevance_with_yandexgpt,
     classify_stock_status_with_yandexgpt,
+    condense_query_with_yandexgpt,
     extract_availability_with_yandexgpt,
     extract_brand_with_yandexgpt,
     extract_contacts_with_yandexgpt,
@@ -193,6 +194,49 @@ def test_extract_availability_prompt_warns_against_picking_one_pickup_point():
     system_prompt = client.chat.completions.calls[0]["messages"][0]["content"]
     assert "самовывоз" in system_prompt.lower()
     assert "просумм" in system_prompt.lower()
+
+
+def test_condense_query_with_yandexgpt_parses_kernel_and_region():
+    """LLM сжимает длинный шаблонный запрос до короткого ядра + региона."""
+    client = _FakeClient(
+        '{"kernel": "обращение с отходами III-IV классов опасности в Чувашии", '
+        '"region": "Чувашия", "reasoning": "убрал лишние цитаты и статью"}'
+    )
+
+    result = condense_query_with_yandexgpt(
+        "ищу компанию в Чувашии по услугам по обращению с отходами...",
+        client=client, model="test-model",
+    )
+
+    assert result.kernel == "обращение с отходами III-IV классов опасности в Чувашии"
+    assert result.region == "Чувашия"
+
+    system_prompt = client.chat.completions.calls[0]["messages"][0]["content"]
+    assert "сжимаешь" in system_prompt
+    assert "ОСТАВЬ" in system_prompt
+
+
+def test_classify_listing_type_prompt_allows_service_provider_pages():
+    """Регрессия: запросы вида 'подрядная организация по изысканиям', где байер
+    ищет УСЛУГУ/подрядчика/компанию (а не купить товар), должны допускать
+    страницы компаний/услуг — иначе LLM-фильтр типа контента жёстко выкидывает
+    всю выдачу и результат пустой. При этом статьи/реестры по-прежнему
+    отсекаются. Проверяем, что промпт явно описывает оба правила."""
+    client = _FakeClient('{"is_listing": true, "reasoning": "страница компании-исполнителя"}')
+
+    classify_listing_type_with_yandexgpt(
+        "ищу подрядную организацию в Татарстане по инженерным изысканиям",
+        "ООО ГеоИзыскания", "инженерные изыскания, тел.",
+        client=client, model="test-model",
+    )
+
+    system_prompt = client.chat.completions.calls[0]["messages"][0]["content"]
+    # Подрядчик/услуга допускается
+    assert "УСЛУГОВОГО запроса" in system_prompt
+    assert "подрядчика" in system_prompt.lower() or "услугу" in system_prompt.lower()
+    # Агрегаторы/реестры (НОСТРОЙ, реестр СРО) — нет
+    assert "НОСТРОЙ" in system_prompt
+    assert "реестр" in system_prompt.lower()
 
 
 def test_ask_json_sends_json_schema_matching_output_model():

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import sqlite3
@@ -31,7 +32,7 @@ from pydantic import BaseModel
 from procurement_search.config import load_categories
 from procurement_search.export import export_companies_to_excel
 from procurement_search.log_explainer import ExplainingLogHandler
-from procurement_search.models import Company, FieldValue
+from procurement_search.models import Company, FieldValue, LEGAL_ADDRESS
 from procurement_search.pipeline import search_and_score, summarize_availability
 from procurement_search.trusted_suppliers import TrustedSupplierStore
 
@@ -41,6 +42,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REPORTS_DIR = PROJECT_ROOT / "reports"
 INDEX_PATH = REPORTS_DIR / "index.json"
 STATIC_DIR = PROJECT_ROOT / "static"
+LOGS_DIR = PROJECT_ROOT / "logs"
 
 app = FastAPI(title="Procurement Search")
 
@@ -146,15 +148,30 @@ def _append_report_entry(entry: dict) -> None:
         _save_report_index_unlocked(entries)
 
 
-def _field_to_dict(field_values: list[FieldValue]) -> dict | None:
+def _preferred_display_value(field_values: list[FieldValue]) -> FieldValue | None:
+    """Первое значение поля для превью — для адреса это фактический адрес
+    работы, а не юридический из ЕГРЮЛ (см. _field_summary в export.py: у
+    kazan.geogrunt.ru юр.адрес в Барнауле, а офис в Казани). Для остальных
+    полей — просто первое значение."""
     if not field_values:
         return None
-    fv = field_values[0]
+    if getattr(field_values[0], "kind", None) == LEGAL_ADDRESS:
+        for fv in field_values:
+            if getattr(fv, "kind", None) != LEGAL_ADDRESS:
+                return fv
+    return field_values[0]
+
+
+def _field_to_dict(field_values: list[FieldValue]) -> dict | None:
+    fv = _preferred_display_value(field_values)
+    if fv is None:
+        return None
     return {
         "value": fv.value,
         "source": fv.source,
         "date": fv.retrieved_at.isoformat(),
         "confidence": fv.confidence.value,
+        "kind": fv.kind,
     }
 
 
@@ -404,6 +421,19 @@ def main() -> None:
     load_dotenv(PROJECT_ROOT / ".env")
 
     logging.basicConfig(level=logging.INFO)
+    # Персистентные логи на хосте (не только stdout контейнера/консоли):
+    # пишем в LOGS_DIR с ротацией, чтобы не занимать диск неограниченно.
+    # Каталог создаётся при первом запуске (процесс может не иметь прав на
+    # корень в контейнере, но logs/ смонтирован/создан на хосте).
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    _log_file = LOGS_DIR / "webapp.log"
+    _rotating = RotatingFileHandler(
+        _log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    _rotating.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logging.getLogger().addHandler(_rotating)
     # Вариант А (design-обсуждение) — детерминированный объяснитель
     # известных ошибок, без LLM (см. log_explainer.py). Как и load_dotenv
     # выше — только здесь, не на уровне модуля: test_webapp.py импортирует

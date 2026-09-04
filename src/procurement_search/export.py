@@ -16,7 +16,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
 from procurement_search.attribute_extractor import Quantity
-from procurement_search.models import Company, StockStatus, VerificationFlag
+from procurement_search.models import Company, LEGAL_ADDRESS, StockStatus, VerificationFlag
 from procurement_search.quantity_match import Verdict
 
 _HEADER_FILL = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
@@ -111,10 +111,26 @@ def _format_quantity(q: Quantity | None) -> str:
     return f"{q.value:g} {q.unit}" if q is not None else ""
 
 
-def _field_summary(field_values) -> tuple[str, str, VerificationFlag]:
+def _preferred_display_value(field_values) -> object | None:
+    """Первое значение поля для превью, интуитивно соответствующее "месту
+    работы". Для адреса это ФАКТИЧЕСКИЙ адрес (со скрапинга сайта/сниппета),
+    а не юридический адрес ЕГРЮЛ: у kazan.geogrunt.ru головной офис в Барнауле,
+    но работают в Казани — показывать как адрес нужно казанский офис, а
+    юридический (Барнаул) оставлять в карточке как доп. источник. Для всех
+    остальных полей (телефон/email/сайт) — просто первое значение, как раньше."""
     if not field_values:
+        return None
+    if getattr(field_values[0], "kind", None) == LEGAL_ADDRESS:
+        for fv in field_values:
+            if getattr(fv, "kind", None) != LEGAL_ADDRESS:
+                return fv
+    return field_values[0]
+
+
+def _field_summary(field_values) -> tuple[str, str, VerificationFlag]:
+    fv = _preferred_display_value(field_values)
+    if fv is None:
         return "", "", VerificationFlag.UNVERIFIED
-    fv = field_values[0]
     return fv.value, f"{fv.source}, {fv.retrieved_at.isoformat()}", fv.confidence
 
 

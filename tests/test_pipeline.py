@@ -1342,6 +1342,58 @@ def test_order_length_never_leaks_into_search_terms(monkeypatch):
         assert "500 метров" not in query
 
 
+def test_condensed_kernel_injected_as_search_term_on_long_query(monkeypatch):
+    """Слой 0 (query_kernel.condense_query): для длинного шаблонного запроса
+    сжатое ядро ("обращение с отходами III-IV классов опасности в Чувашии")
+    должно уйти в поисковый термин, чтобы поисковик понял суть без
+    юридического мусора (цитаты статей, номера законов)."""
+    search_calls: list[str] = []
+
+    def fake_search(query: str) -> list[Candidate]:
+        search_calls.append(query)
+        return []
+
+    # Включённый use_llm_fallback + длинный запрос -> condense_query реально
+    # вызывается и возвращает ядро.
+    monkeypatch.setattr(
+        pipeline, "condense_query", lambda raw, use_llm_fallback=False: (
+            "обращение с отходами III-IV классов опасности в Чувашии" if use_llm_fallback else None
+        )
+    )
+    _patch_sources(monkeypatch, fake_search)
+
+    long_query = (
+        "ищу компанию в Чувашии по услугам по обращению с отходами производства и потребления "
+        "III-IV классов опасности (далее — отходы), включая сбор, транспортирование. "
+        "Обязательное наличие лицензии на деятельность по сбору отходов I-IV классов опасности "
+    )
+    search_and_score(long_query, use_llm_fallback=True, verify_websites=False)
+
+    assert any("отходами III-IV классов опасности в Чувашии" in q for q in search_calls)
+
+
+def test_no_kernel_keeps_at_most_three_search_terms(monkeypatch):
+    """Без ядра (ядро = None, обычный случай) поведение не меняется: поисковых
+    терминов не больше 3 (raw + бренд-термин + clean), как было до этой фичи."""
+    search_calls: list[str] = []
+
+    def fake_search(query: str) -> list[Candidate]:
+        search_calls.append(query)
+        return []
+
+    monkeypatch.setattr(pipeline, "condense_query", lambda raw, use_llm_fallback=False: None)
+    _patch_sources(monkeypatch, fake_search)
+
+    # Запрос с брендом -> было бы 2 термина без чистого (clean) при бренде? На
+    # деле термин clean всегда есть; проверяем только верхнюю границу 3.
+    search_and_score(
+        "генератор бензиновый Hunter 11 шт", use_llm_fallback=True, verify_websites=False
+    )
+
+    # Один источник; каждый термин уходит ровно одним вызовом search().
+    assert len(search_calls) <= 3
+
+
 def test_search_result_exposes_order_length_and_effective_amount(monkeypatch):
     def fake_candidates(query: str) -> list[Candidate]:
         return []

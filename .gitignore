@@ -5,4 +5,5 @@ __pycache__/
 *.xlsx
 reports/
 data/
+logs/
 .env

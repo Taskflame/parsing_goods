@@ -6,35 +6,61 @@
 <title>Поиск поставщиков</title>
 <style>
   :root {
-    --bg: #f8fafc;
+    /* Первичная палитра Systeme Electric */
+    --se-techno-green: #00ac86;
+    --se-eco-green: #9fd883;
+
+    /* Дополнительная палитра Systeme Electric */
+    --se-sky-blue: #00b2d2;
+    --se-deep-sea-blue: #2e669d;
+    --se-coral-pink: #f26f75;
+    --se-mustard-yellow: #dad662;
+    --se-dark-grey: #65655f;
+    --se-light-grey: #d5d4c5;
+
+    --bg: #f6f8f7;
     --panel: #ffffff;
-    --border: #e2e8f0;
-    --text: #1e293b;
-    --muted: #64748b;
-    --accent: #1f2937;
-    --confirmed: #d1fae5;
-    --confirmed-text: #065f46;
-    --unverified: #fef3c7;
-    --unverified-text: #92400e;
-    --stale: #fee2e2;
-    --stale-text: #991b1b;
-    --not-checked: #e5e7eb;
-    --not-checked-text: #374151;
+    --border: #e3e7e3;
+    --text: #30332f;
+    --muted: #65655f;
+    --accent: var(--se-techno-green);
+    --accent-hover: #009a78;
+
+    --confirmed: rgba(0, 172, 134, 0.14);
+    --confirmed-text: #006b56;
+    --unverified: rgba(218, 214, 98, 0.24);
+    --unverified-text: #6d6112;
+    --stale: rgba(242, 111, 117, 0.16);
+    --stale-text: #a8353c;
+    --not-checked: #eef0eb;
+    --not-checked-text: #65655f;
+    --clarify: rgba(218, 214, 98, 0.24);
+    --clarify-text: #6d6112;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg);
+    font-family: "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background:
+      radial-gradient(circle at top left, rgba(0, 172, 134, 0.10), transparent 34rem),
+      radial-gradient(circle at top right, rgba(0, 178, 210, 0.08), transparent 30rem),
+      var(--bg);
     color: var(--text);
   }
   header {
-    background: var(--accent);
+    background: linear-gradient(30deg, var(--se-techno-green) 0%, var(--se-techno-green) 70%, var(--se-eco-green) 100%);
     color: #fff;
-    padding: 20px 24px;
+    padding: 24px 24px;
   }
-  header h1 { margin: 0; font-size: 1.25rem; }
-  header p { margin: 4px 0 0; color: #cbd5e1; font-size: 0.85rem; }
+  header .brand {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.82);
+  }
+  header h1 { margin: 6px 0 0; font-size: 1.3rem; font-weight: 700; letter-spacing: -0.01em; }
+  header p { margin: 6px 0 0; color: rgba(255, 255, 255, 0.82); font-size: 0.85rem; }
   main {
     max-width: 1100px;
     margin: 24px auto;
@@ -46,8 +72,11 @@
   section.panel {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 16px;
     padding: 20px;
+    box-shadow:
+      0 18px 50px rgba(46, 102, 157, 0.06),
+      0 2px 8px rgba(101, 101, 95, 0.04);
   }
   .search-form {
     display: flex;
@@ -81,6 +110,28 @@
     gap: 6px;
     white-space: nowrap;
   }
+  .advanced {
+    margin-top: 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .advanced label {
+    font-size: 0.85rem;
+    color: var(--text);
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    line-height: 1.35;
+  }
+  .advanced input[type="checkbox"] {
+    margin-top: 3px;
+    flex-shrink: 0;
+  }
   button {
     padding: 10px 18px;
     border: none;
@@ -88,16 +139,19 @@
     background: var(--accent);
     color: #fff;
     font-size: 0.95rem;
+    font-weight: 600;
     cursor: pointer;
   }
+  button:hover:not(:disabled) { background: var(--accent-hover); }
   button:disabled { opacity: 0.5; cursor: default; }
   button.secondary {
     background: transparent;
-    color: var(--accent);
+    color: var(--se-techno-green);
     border: 1px solid var(--border);
     padding: 6px 12px;
     font-size: 0.85rem;
   }
+  button.secondary:hover:not(:disabled) { background: rgba(0, 172, 134, 0.08); }
   #status { color: var(--muted); font-size: 0.9rem; min-height: 1.2em; }
   #status.error { color: var(--stale-text); }
   table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
@@ -114,12 +168,12 @@
   .badge.unverified { background: var(--unverified); color: var(--unverified-text); }
   .badge.stale { background: var(--stale); color: var(--stale-text); }
   .badge.not-checked { background: var(--not-checked); color: var(--not-checked-text); }
-  .badge.clarify { background: var(--unverified); color: var(--unverified-text); }
+  .badge.clarify { background: var(--clarify); color: var(--clarify-text); }
   .muted { color: var(--muted); }
   .score-total { font-weight: 700; }
   .table-wrap { overflow-x: auto; }
   .panel h2 { margin: 0 0 14px; font-size: 1.05rem; }
-  a.download { color: var(--accent); text-decoration: none; font-weight: 600; }
+  a.download { color: var(--se-techno-green); text-decoration: none; font-weight: 600; }
   a.download:hover { text-decoration: underline; }
   .empty { color: var(--muted); font-size: 0.9rem; padding: 8px 0; }
   .tree-category { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
@@ -136,7 +190,7 @@
     font-size: 0.92rem;
     color: var(--text);
   }
-  .tree-category-header:hover { background: var(--border); }
+  .tree-category-header:hover { background: rgba(0, 172, 134, 0.08); }
   .tree-category-chevron { transition: transform 0.15s ease; display: inline-block; color: var(--muted); }
   .tree-category-header[aria-expanded="true"] .tree-category-chevron { transform: rotate(90deg); }
   .tree-category-code { font-weight: 700; }
@@ -154,6 +208,7 @@
 </head>
 <body>
 <header>
+  <div class="brand">Systeme Electric</div>
   <h1>Поиск поставщиков — прототип ИИ в закупках</h1>
   <p>Пайплайн: Слой 0 (атрибуты/бренд) → поиск (Google CSE / Yandex Search) → дедуп → скоринг → отчёт</p>
 </header>
@@ -163,14 +218,17 @@
     <h2>Новый поиск</h2>
     <form class="search-form" id="search-form">
       <input type="text" id="query" placeholder="Например: гальванические покрытия" required>
-      <label><input type="checkbox" id="use-llm"> LLM-fallback: опечатки в единицах измерения, бренд в поиске (нужен YANDEX_FM_API_KEY)</label>
-      <label><input type="checkbox" id="deep-relevance"> Слой 2: краулить сайты кандидатов, находить цену и сортировать по ней (медленнее, точнее)</label>
-      <label><input type="checkbox" id="relevance-llm-check"> LLM-фильтр: статьи/видео сразу; соответствие товара, характеристик и наличие товара — вместе со Слоем 2</label>
-      <label><input type="checkbox" id="use-trusted-suppliers"> Сначала искать среди проверенных поставщиков категории, потом — глобальный поиск (нужен YANDEX_FM_API_KEY)</label>
-      <label><input type="checkbox" id="check-availability"> Слой 4: проверять остаток и сравнивать с запрошенным количеством (требует Слой 2 и YANDEX_FM_API_KEY, дороже LLM-фильтра)</label>
-      <label><input type="checkbox" id="probe-stepper"> ПИЛОТ: кликать степпер количества на странице (headless-браузер, требует Слой 4 и `playwright install chromium` на сервере, заметно медленнее — эвристика, не гарантия)</label>
+      <button type="button" class="secondary" id="advanced-toggle">Доп настройки ▾</button>
       <button type="submit" id="submit-btn">Найти</button>
     </form>
+    <div id="advanced-options" class="advanced" style="display:none">
+      <label><input type="checkbox" id="use-llm" checked> LLM-fallback: опечатки в единицах измерения, бренд в поиске (нужен YANDEX_FM_API_KEY)</label>
+      <label><input type="checkbox" id="deep-relevance" checked> Слой 2: краулить сайты кандидатов, находить цену и сортировать по ней (медленнее, точнее)</label>
+      <label><input type="checkbox" id="relevance-llm-check" checked> LLM-фильтр: статьи/видео сразу; соответствие товара, характеристик и наличие товара — вместе со Слоем 2</label>
+      <label><input type="checkbox" id="use-trusted-suppliers" checked> Сначала искать среди проверенных поставщиков категории, потом — глобальный поиск (нужен YANDEX_FM_API_KEY)</label>
+      <label><input type="checkbox" id="check-availability" checked> Слой 4: проверять остаток и сравнивать с запрошенным количеством (требует Слой 2 и YANDEX_FM_API_KEY, дороже LLM-фильтра)</label>
+      <label><input type="checkbox" id="probe-stepper" checked> ПИЛОТ: кликать степпер количества на странице (headless-браузер, требует Слой 4 и `playwright install chromium` на сервере, заметно медленнее — эвристика, не гарантия)</label>
+    </div>
     <div id="status"></div>
   </section>
 
@@ -258,6 +316,16 @@ const addTrustedToggle = document.getElementById('add-trusted-toggle');
 const addTrustedForm = document.getElementById('add-trusted-form');
 const addTrustedCategory = document.getElementById('add-trusted-category');
 const addTrustedStatus = document.getElementById('add-trusted-status');
+
+// Сворачивание/разворачивание расширенных опций поиска под кнопкой
+// «Доп настройки». Настройки скрыты для простоты, но включены по умолчанию.
+const advancedToggle = document.getElementById('advanced-toggle');
+const advancedOptions = document.getElementById('advanced-options');
+advancedToggle.addEventListener('click', () => {
+  const nowVisible = advancedOptions.style.display !== 'none';
+  advancedOptions.style.display = nowVisible ? 'none' : '';
+  advancedToggle.textContent = nowVisible ? 'Доп настройки ▾' : 'Доп настройки ▴';
+});
 
 function badge(confidence) {
   const map = {

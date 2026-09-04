@@ -22,7 +22,14 @@ from datetime import date
 
 import requests
 
-from procurement_search.models import Candidate, Company, FieldValue, VerificationFlag
+from procurement_search.models import (
+    ACTUAL_ADDRESS,
+    LEGAL_ADDRESS,
+    Candidate,
+    Company,
+    FieldValue,
+    VerificationFlag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +70,13 @@ def _contacts_from_candidates(candidate_group: list[Candidate]) -> dict[str, lis
             )
         if c.address_raw:
             contacts["address"].append(
-                FieldValue(c.address_raw, c.source, c.scraped_at, VerificationFlag.UNVERIFIED)
+                FieldValue(
+                    c.address_raw,
+                    c.source,
+                    c.scraped_at,
+                    VerificationFlag.UNVERIFIED,
+                    kind=ACTUAL_ADDRESS,
+                )
             )
     return contacts
 
@@ -123,8 +136,10 @@ class DadataEnricher(Enricher):
         pulscen/optlist — если компания сменила название или
         реорганизовалась, в отчёте будет актуальное имя, а не то, что
         осталось в старом объявлении на сайте-каталоге;
-      - юридический адрес из ЕГРЮЛ добавляется первым в список с флагом
-        "подтверждён" (не заменяет адрес со скрапинга, а дополняет его).
+      - юридический адрес из ЕГРЮЛ дописывается в конец списка с флагом
+        "подтверждён" и kind="юридический" (не заменяет адрес со скрапинга,
+        а дополняет его и НЕ подменяет фактический адрес работы на превью —
+        см. _preferred_display_value в export.py/webapp.py).
 
     Не решает целиком: контроль актуальности ТЕЛЕФОНА/EMAIL (нужна
     отдельная проверка — см. verify_contacts.py) и полную историю всех
@@ -178,7 +193,13 @@ class DadataEnricher(Enricher):
             match, fallback_name=primary.name_raw, source_label="ЕГРЮЛ (Dadata)"
         )
         if address_field is not None:
-            contacts.setdefault("address", []).insert(0, address_field)
+            # append, а не insert(0, ...): юридический адрес ЕГРЮЛ не должен
+            # подменять фактический адрес работы на превью (export/webapp
+            # показывают только первое значение поля). У kazan.geogrunt.ru
+            # юр.адрес в Барнауле, а офис в Казани — append оставляет
+            # фактический адрес первым, юридический — вторым (см. kind=
+            # LEGAL_ADDRESS и _preferred_display_value в export/webapp).
+            contacts.setdefault("address", []).append(address_field)
 
         return Company(
             inn=inn,
@@ -206,7 +227,7 @@ class DadataEnricher(Enricher):
             match, fallback_name=legal_name, source_label="ЕГРЮЛ (Dadata, по названию со Слоя 2)"
         )
         if address_field is not None:
-            company.contacts.setdefault("address", []).insert(0, address_field)
+            company.contacts.setdefault("address", []).append(address_field)
 
         company.inn = inn
         company.ogrn = ogrn
@@ -263,7 +284,13 @@ def _fields_from_suggestion(
     name_field = FieldValue(official_name, source_label, today, VerificationFlag.CONFIRMED)
     address_value = (data.get("address") or {}).get("value")
     address_field = (
-        FieldValue(address_value, source_label, today, VerificationFlag.CONFIRMED)
+        FieldValue(
+            address_value,
+            source_label,
+            today,
+            VerificationFlag.CONFIRMED,
+            kind=LEGAL_ADDRESS,
+        )
         if address_value
         else None
     )

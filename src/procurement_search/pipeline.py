@@ -29,6 +29,7 @@ from procurement_search.dedup import dedup_candidates
 from procurement_search.enrichment import DadataEnricher, Enricher, NullEnricher
 from procurement_search.export import export_companies_to_excel
 from procurement_search.models import (
+    ACTUAL_ADDRESS,
     Candidate,
     Company,
     FieldValue,
@@ -37,6 +38,7 @@ from procurement_search.models import (
     VerificationFlag,
 )
 from procurement_search.query_normalizer import normalize_query
+from procurement_search.query_kernel import condense_query
 from procurement_search.quantity_match import (
     VERDICT_SORT_ORDER,
     Verdict,
@@ -535,6 +537,14 @@ def search_and_score(
     # работает для любого запроса, где LLM распознала имя производителя.
     brand = extract_brand(normalized.raw_query, use_llm_fallback=use_llm_fallback)
 
+    # Слой 0 (доп.): сжатое ядро для длинных шаблонных запросов (query_kernel.py).
+    # Тот же флаг use_llm_fallback, что и у бренда: длинный юридический текст
+    # ("...Статья 23 ФЗ-458: ...") сжимается до сути ("обращение с отходами
+    # III-IV классов опасности в Чувашии"), которая пойдёт в поисковик отдельным
+    # термином. Для коротких запросов, выключенного флага или недоступного LLM
+    # возвращает None — и поисковые термины строятся как раньше.
+    kernel = condense_query(normalized.raw_query, use_llm_fallback=use_llm_fallback)
+
     # Слой 0.6 (см. attribute_extractor.classify_roles) — какие из чисел
     # query_extraction являются количеством ЗАКУПКИ (order_qty), а не
     # характеристикой товара. classify_roles — чистый пост-процессинг уже
@@ -699,9 +709,19 @@ def search_and_score(
             without_brand = re.sub(r"\s+", " ", without_brand).strip()
             brand_first_term = f"{brand} {without_brand}".strip() if without_brand else brand
             extra_terms.insert(0, brand_first_term)
+        # Слой 0 (query_kernel.py, см. выше kernel): сжатое ядро длинного
+        # шаблонного запроса — короткая осмысленная формулировка, понятная
+        # поисковику без юридической каши. Добавляется как отдельный термин.
+        # Длинный raw_query при этом НЕ выбрасывается: раз есть ядро, разрешаем
+        # до 4 поисковых запросов к источнику вместо 3, чтобы ушли и ядро, и
+        # полный оригинал (ничего не теряется, дедуп всё равно схлопнется).
+        if kernel:
+            extra_terms.insert(0, kernel)
+        max_terms = 4 if kernel else 3
         search_terms = list(dict.fromkeys([search_raw_query, *extra_terms]))
         for source in sources:
-            for term in search_terms[:3]:  # raw_query + бренд-термин + clean_text, не больше
+            # raw_query + (ядро) + бренд-термин + clean_text, не больше max_terms
+            for term in search_terms[:max_terms]:
                 found = source.search(term)
                 logger.info("%s: %d кандидатов по запросу '%s'", source.name, len(found), term)
                 candidates.extend(found)
@@ -1160,7 +1180,14 @@ def _attach_site_contacts(company: Company, site_text: str, use_llm: bool = Fals
         match = first_match(pattern, site_text)
         if match:
             company.contacts.setdefault(field_name, []).insert(
-                0, FieldValue(match, "текст сайта (Слой 2)", today, VerificationFlag.UNVERIFIED)
+                0,
+                FieldValue(
+                    match,
+                    "текст сайта (Слой 2)",
+                    today,
+                    VerificationFlag.UNVERIFIED,
+                    kind=(ACTUAL_ADDRESS if field_name == "address" else None),
+                ),
             )
         else:
             missing_fields.append(field_name)
@@ -1175,7 +1202,14 @@ def _attach_site_contacts(company: Company, site_text: str, use_llm: bool = Fals
     for field_name, value in (("phone", llm_phone), ("email", llm_email), ("address", llm_address)):
         if field_name in missing_fields and value:
             company.contacts.setdefault(field_name, []).insert(
-                0, FieldValue(value, "текст сайта (Слой 2, LLM)", today, VerificationFlag.UNVERIFIED)
+                0,
+                FieldValue(
+                    value,
+                    "текст сайта (Слой 2, LLM)",
+                    today,
+                    VerificationFlag.UNVERIFIED,
+                    kind=(ACTUAL_ADDRESS if field_name == "address" else None),
+                ),
             )
 
 

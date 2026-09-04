@@ -4,7 +4,15 @@ import openpyxl
 
 from procurement_search.attribute_extractor import Quantity
 from procurement_search.export import export_companies_to_excel
-from procurement_search.models import Availability, AvailabilityStatus, Company, FieldValue
+from procurement_search.models import (
+    ACTUAL_ADDRESS,
+    Availability,
+    AvailabilityStatus,
+    Company,
+    FieldValue,
+    LEGAL_ADDRESS,
+    VerificationFlag,
+)
 from procurement_search.quantity_match import Verdict
 
 
@@ -98,3 +106,51 @@ def test_export_without_availability_leaves_new_columns_blank(tmp_path):
     # остальных пустых колонок в этом экспортере).
     assert ws.cell(row=2, column=_COL_FOUND_QTY).value is None
     assert ws.cell(row=2, column=_COL_AVAILABILITY_VERDICT).value is None
+
+
+def test_export_shows_actual_address_over_legal_egrul_address(tmp_path):
+    """Превью адреса показывает ФАКТИЧЕСКИЙ адрес работы (Казань), а не
+    юридический адрес ЕГРЮЛ (Барнаул) — у kazan.geogrunt.ru головной офис в
+    Барнауле, но компания работает в Казани (design-обсуждение: юридический
+    адрес закладывается в карточку как доп. источник, но не подменяет место
+    работы на превью)."""
+    company = _company("ООО Геогрунт")
+    company.contacts["address"] = [
+        FieldValue(
+            "г Казань, ул Сибирский Тракт, д 39, помещ 1002",
+            "текст сайта (Слой 2)",
+            date(2026, 8, 7),
+            VerificationFlag.UNVERIFIED,
+            kind=ACTUAL_ADDRESS,
+        ),
+        FieldValue(
+            "656031, АЛТАЙСКИЙ КРАЙ, Г.О. ГОРОД БАРНАУЛ, Г. БАРНАУЛ, УЛ. ПРИВОКЗАЛЬНАЯ, Д. 49",
+            "ЕГРЮЛ (Dadata)",
+            date(2026, 8, 7),
+            VerificationFlag.CONFIRMED,
+            kind=LEGAL_ADDRESS,
+        ),
+    ]
+
+    output = export_companies_to_excel([company], tmp_path / "out.xlsx")
+    wb = openpyxl.load_workbook(output)
+    ws = wb.active
+    # Адрес — колонка 8, источник/дата адреса — колонка 9
+    assert "Казань" in ws.cell(row=2, column=8).value
+    assert "Барнаул" not in ws.cell(row=2, column=8).value
+
+    # Наоборот, когда фактического адреса нет — показывается юридический из ЕГРЮЛ
+    company2 = _company("ООО Только юр.адрес")
+    company2.contacts["address"] = [
+        FieldValue(
+            "г. Москва, ул. Ленина, 1",
+            "ЕГРЮЛ (Dadata)",
+            date(2026, 8, 7),
+            VerificationFlag.CONFIRMED,
+            kind=LEGAL_ADDRESS,
+        ),
+    ]
+    output2 = export_companies_to_excel([company2], tmp_path / "out2.xlsx")
+    wb2 = openpyxl.load_workbook(output2)
+    ws2 = wb2.active
+    assert "Москва" in ws2.cell(row=2, column=8).value
