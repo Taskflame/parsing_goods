@@ -88,6 +88,8 @@ class SearchIntent:
     type: IntentType
     entity: str | None = None
     service: str | None = None
+    subject: str | None = None
+    identity_text: str | None = None
     brand: str | None = None
     model: str | None = None
     quantity: Quantity | None = None

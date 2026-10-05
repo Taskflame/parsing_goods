@@ -16,6 +16,9 @@ from procurement_search.models import (
     PageType,
     ProductMatch,
     ProductOffer,
+    ScoreBreakdown,
+    ServiceMatch,
+    ServiceOffer,
     VerificationFlag,
 )
 from procurement_search.quantity_match import Verdict
@@ -66,6 +69,54 @@ def test_export_service_intent_uses_service_headers(tmp_path):
     assert "Соответствие услуге" in headers
     assert "Наличие товара" not in headers
     assert "Цена / тариф" in headers
+
+
+def test_export_service_writes_service_offer_fields(tmp_path):
+    company = _company("ООО Эко")
+    company.sources = ["yandex_search"]
+    company.score = ScoreBreakdown(relevance=0.8, trust=0.7, confidence=0.6, total=0.5)
+    company.service_offers.append(
+        ServiceOffer(
+            company_id=None,
+            landing_url="https://eco.example/uslugi/utilizaciya/",
+            page_type=PageType.SERVICE_DETAIL,
+            service_match=ServiceMatch.MATCH,
+            service_name="утилизация и обезвреживание отходов",
+            description="Утилизация отходов. Стоимость от 5 000 руб.",
+            price=5000.0,
+            currency="RUB",
+            pricing_unit="за выезд",
+            evidence=[
+                Evidence(
+                    field="service_match",
+                    value="match",
+                    source_url="https://eco.example/uslugi/utilizaciya/",
+                    source_text="Утилизация отходов. Стоимость от 5 000 руб.",
+                ),
+                Evidence(
+                    field="price",
+                    value="5 000 руб.",
+                    source_url="https://eco.example/uslugi/utilizaciya/",
+                    source_text="Стоимость от 5 000 руб.",
+                ),
+            ],
+        )
+    )
+
+    output = export_companies_to_excel(
+        [company],
+        tmp_path / "service-row.xlsx",
+        intent_type=IntentType.SERVICE,
+    )
+
+    wb = openpyxl.load_workbook(output)
+    ws = wb.active
+
+    assert ws.cell(row=2, column=1).value == "ООО Эко"
+    assert ws.cell(row=2, column=13).value == "match"
+    assert "Утилизация отходов" in ws.cell(row=2, column=14).value
+    assert ws.cell(row=2, column=17).value == "за выезд"
+    assert ws.cell(row=2, column=23).value == "5 000 руб."
 
 
 def test_export_product_intent_uses_offer_price_when_company_price_missing(tmp_path):

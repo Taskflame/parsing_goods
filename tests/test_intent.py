@@ -1,6 +1,6 @@
 from procurement_search.attribute_extractor import classify_roles, extract_attributes
 from procurement_search.config import load_spec_ranges, load_units
-from procurement_search.intent import classify_page_type, match_product, match_service, parse_intent
+from procurement_search.intent import build_search_terms, classify_page_type, match_product, match_service, parse_intent
 from procurement_search.models import IntentType, PageType, ProductMatch, ServiceMatch
 
 
@@ -48,6 +48,40 @@ def test_service_intent_accepts_service_pages():
     assert intent.type == IntentType.SERVICE
     assert classify_page_type("https://eco.example/uslugi/utilizaciya/", "Утилизация отходов") == PageType.SERVICE_DETAIL
     assert match_service(intent, "Утилизация и обезвреживание отходов", "Оказываем услуги") == ServiceMatch.MATCH
+
+
+def test_service_action_with_product_subject_stays_service():
+    intent = _intent("ремонт генератора")
+
+    assert intent.type == IntentType.SERVICE
+    assert intent.service == "ремонт"
+    assert intent.subject == "генератора"
+
+
+def test_service_url_with_single_price_stays_service_detail():
+    assert (
+        classify_page_type(
+            "https://eco.example/uslugi/utilizaciya/",
+            "Утилизация отходов",
+            "Стоимость от 5 000 руб.",
+        )
+        == PageType.SERVICE_DETAIL
+    )
+
+
+def test_product_search_identity_keeps_full_product_name():
+    intent = _intent("Lenovo ThinkPad P16v 100 шт", brand="Lenovo")
+
+    terms = build_search_terms(
+        "Lenovo ThinkPad P16v",
+        intent,
+        "Lenovo ThinkPad P16v",
+        "Lenovo",
+        None,
+    )
+
+    assert '"Lenovo ThinkPad P16v"' in terms
+    assert '"Lenovo P16v"' not in terms
 
 
 def test_directory_is_not_final_offer_page_type():

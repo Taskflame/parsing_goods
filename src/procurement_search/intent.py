@@ -26,9 +26,17 @@ _SERVICE_WORDS = (
     "обслуживан",
     "ремонт",
     "монтаж",
-    "работ",
     "гальван",
     "покрыт",
+    "цинкован",
+)
+_SERVICE_ACTION_WORDS = (
+    "ремонт",
+    "монтаж",
+    "обслуживан",
+    "утилизац",
+    "обезвреж",
+    "гальван",
     "цинкован",
 )
 _PRODUCT_WORDS = (
@@ -90,12 +98,15 @@ def parse_intent(
     """
     lowered = raw_query.lower()
     has_service_words = any(w in lowered for w in _SERVICE_WORDS)
+    has_service_action = any(w in lowered for w in _SERVICE_ACTION_WORDS)
     has_product_words = any(w in lowered for w in _PRODUCT_WORDS)
     has_specs = bool(parsed_query.specs if parsed_query else extraction and extraction.attributes)
     has_model = bool(parsed_query and parsed_query.model)
     has_brand = bool(brand or (parsed_query and parsed_query.brand))
 
-    if has_service_words and not (has_brand or has_model or has_specs or has_product_words):
+    if has_service_action or (
+        has_service_words and not (has_brand or has_model or has_specs or has_product_words)
+    ):
         intent_type = IntentType.SERVICE
     else:
         intent_type = IntentType.PRODUCT
@@ -103,19 +114,23 @@ def parse_intent(
     if intent_type == IntentType.SERVICE:
         radius = _extract_radius_km(raw_query)
         hard_constraints = {"radius_km": radius} if radius is not None else {}
+        service, subject = _split_service_action_subject(raw_query, parsed_query)
         return SearchIntent(
             type=IntentType.SERVICE,
-            service=_strip_quantity_text(raw_query, parsed_query),
+            service=service,
+            subject=subject,
             quantity=None,
             hard_constraints=hard_constraints,
         )
 
     entity = _guess_product_entity(parsed_query.product if parsed_query else raw_query)
+    model = _guess_product_model(raw_query, parsed_query, brand)
     return SearchIntent(
         type=IntentType.PRODUCT,
         entity=entity,
         brand=brand or (parsed_query.brand if parsed_query else None),
-        model=_guess_product_model(raw_query, parsed_query, brand),
+        model=model,
+        identity_text=_guess_identity_text(raw_query, parsed_query, brand, model),
         quantity=_effective_quantity(parsed_query),
         attributes=dict(parsed_query.specs) if parsed_query else {},
     )
@@ -142,6 +157,9 @@ def classify_page_type(url: str | None, title: str | None = None, text: str | No
 
     has_stock_signal = bool(_STOCK_SIGNAL_RE.search(haystack))
 
+    if any(w in path for w in _SERVICE_URL_WORDS):
+        return PageType.SERVICE_DETAIL if has_service_signal(haystack) else PageType.SERVICE_CATEGORY
+
     if (
         has_product_schema
         or has_sku
@@ -152,8 +170,6 @@ def classify_page_type(url: str | None, title: str | None = None, text: str | No
         return PageType.PRODUCT_DETAIL
     if has_item_list or price_count >= 3 or any(w in path for w in _CATEGORY_URL_WORDS):
         return PageType.PRODUCT_CATEGORY
-    if any(w in path for w in _SERVICE_URL_WORDS):
-        return PageType.SERVICE_DETAIL if has_service_signal(haystack) else PageType.SERVICE_CATEGORY
     if path in ("", "/"):
         return PageType.COMPANY_HOME
     if has_service_signal(haystack):
@@ -172,8 +188,7 @@ def match_product(intent: SearchIntent, title: str | None = None, text: str | No
         model = intent.model.lower()
         if _contains_phrase(haystack, model):
             return ProductMatch.EXACT
-        requested_family = _model_family(model)
-        if requested_family and requested_family in haystack:
+        if _has_conflicting_model_token(haystack, model):
             return ProductMatch.MISMATCH
         return ProductMatch.UNKNOWN
 
@@ -256,6 +271,19 @@ def _strip_quantity_text(raw_query: str, parsed_query: ParsedQuery | None) -> st
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _split_service_action_subject(raw_query: str, parsed_query: ParsedQuery | None) -> tuple[str, str | None]:
+    text = _strip_quantity_text(raw_query, parsed_query)
+    lowered = text.lower()
+    action_match = re.search(r"\b(ремонт|монтаж|обслуживание|утилизация|обезвреживание|цинкование)\b", lowered)
+    if not action_match:
+        return text, None
+    action = text[action_match.start() : action_match.end()]
+    subject = text[action_match.end() :].strip(" ,.-")
+    if action.lower() not in {"ремонт", "монтаж", "обслуживание"}:
+        return text, subject or None
+    return action, subject or None
+
+
 def _effective_quantity(parsed_query: ParsedQuery | None) -> Quantity | None:
     if parsed_query is None:
         return None
@@ -300,11 +328,28 @@ def _contains_phrase(text: str, phrase: str) -> bool:
 
 
 def _model_family(model: str) -> str | None:
-    match = re.match(r"([a-zа-яё]+)(\d+)", model, re.IGNORECASE)
+    tokens = _MODEL_TOKEN_RE.findall(model)
+    token = tokens[-1] if tokens else model
+    match = re.match(r"([a-zа-яё]+)(\d+)", token, re.IGNORECASE)
     return match.group(1).lower() if match else None
 
 
+def _has_conflicting_model_token(text: str, requested_model: str) -> bool:
+    requested_family = _model_family(requested_model)
+    if not requested_family:
+        return False
+    for token in _MODEL_TOKEN_RE.findall(text):
+        token_lower = token.lower()
+        if _contains_phrase(token_lower, requested_model.lower()):
+            continue
+        if _model_family(token_lower) == requested_family:
+            return True
+    return False
+
+
 def _quantity_appears(qty: Quantity, text: str) -> bool:
+    if qty.raw and qty.raw.lower() in text.lower():
+        return True
     return any(_quantities_close(qty, found) for found in _compatible_quantities(qty, text))
 
 
@@ -348,11 +393,30 @@ def _quantities_close(expected: Quantity, found: Quantity) -> bool:
 
 
 def _product_identity_text(intent: SearchIntent, fallback: str) -> str:
+    if intent.identity_text:
+        return intent.identity_text
     if intent.brand and intent.model:
         return f"{intent.brand} {intent.model}"
     if intent.model:
         return intent.model
     return fallback
+
+
+def _guess_identity_text(
+    raw_query: str,
+    parsed_query: ParsedQuery | None,
+    brand: str | None,
+    model: str | None,
+) -> str | None:
+    text = raw_query
+    text = _strip_quantity_text(text, parsed_query)
+    if brand:
+        brand_match = re.search(re.escape(brand), text, re.IGNORECASE)
+        if brand_match:
+            text = text[brand_match.start() :]
+    if model and model.lower() not in text.lower():
+        return f"{brand} {model}".strip() if brand else model
+    return re.sub(r"\s+", " ", text).strip() or None
 
 
 def _attribute_search_terms(intent: SearchIntent, clean_query_text: str) -> list[str]:

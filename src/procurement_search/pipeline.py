@@ -392,7 +392,28 @@ def _is_knockout(company: Company) -> bool:
     return company.status in DEAD_COMPANY_STATUSES
 
 
-def _filter_non_listings(companies: list[Company], raw_query: str, intent=None) -> list[Company]:
+def _filter_by_intent(companies: list[Company], intent=None) -> list[Company]:
+    """Детерминированная intent-отсечка, работает всегда и без LLM."""
+    if intent is None:
+        return companies
+    kept: list[Company] = []
+    for company in companies:
+        primary = company.raw_candidates[0] if company.raw_candidates else None
+        snippet = primary.description_raw if primary else None
+        page_type = _candidate_page_type(primary)
+        if intent.type == IntentType.PRODUCT:
+            if page_type in {PageType.SERVICE_DETAIL, PageType.SERVICE_CATEGORY, PageType.DIRECTORY, PageType.CONTENT}:
+                continue
+            if intent.model and _candidate_product_match(primary, intent) == ProductMatch.MISMATCH:
+                continue
+        elif intent.type == IntentType.SERVICE:
+            if page_type in {PageType.PRODUCT_DETAIL, PageType.PRODUCT_CATEGORY, PageType.DIRECTORY, PageType.CONTENT}:
+                continue
+        kept.append(company)
+    return kept
+
+
+def _filter_non_listings(companies: list[Company], raw_query: str) -> list[Company]:
     """LLM-фильтр по заголовку+сниппету (design-обсуждение: в выдаче
     попадались статьи/видео/обзоры — "Как работает портативный генератор"
     на rutube.ru, "Белый список производителей" на блоге — у которых
@@ -415,17 +436,6 @@ def _filter_non_listings(companies: list[Company], raw_query: str, intent=None) 
     for company in companies:
         primary = company.raw_candidates[0] if company.raw_candidates else None
         snippet = primary.description_raw if primary else None
-        page_type = _candidate_page_type(primary)
-        if intent is not None and intent.type == IntentType.PRODUCT:
-            if page_type in {PageType.SERVICE_DETAIL, PageType.SERVICE_CATEGORY, PageType.DIRECTORY, PageType.CONTENT}:
-                continue
-            if _candidate_product_match(primary, intent) == ProductMatch.MISMATCH:
-                continue
-        elif intent is not None and intent.type == IntentType.SERVICE:
-            if page_type in {PageType.PRODUCT_DETAIL, PageType.PRODUCT_CATEGORY, PageType.DIRECTORY, PageType.CONTENT}:
-                continue
-            if match_service(intent, company.name.value, snippet) == ServiceMatch.MISMATCH:
-                continue
         verdict = classify_listing_type(raw_query, company.name.value, snippet)
         if verdict is False:
             continue
@@ -443,6 +453,18 @@ def _candidate_product_match(candidate: Candidate | None, intent) -> ProductMatc
     if candidate is None:
         return ProductMatch.UNKNOWN
     return match_product(intent, candidate.name_raw, candidate.description_raw)
+
+
+def _is_confirmed_product_offer(intent, page_type: PageType, product_match: ProductMatch, landing_text: str | None) -> bool:
+    if intent is None or intent.type != IntentType.PRODUCT:
+        return True
+    if not landing_text or page_type != PageType.PRODUCT_DETAIL:
+        return False
+    if intent.model:
+        return product_match == ProductMatch.EXACT
+    if intent.attributes:
+        return product_match == ProductMatch.COMPATIBLE
+    return page_type not in {PageType.DIRECTORY, PageType.CONTENT}
 
 
 def _candidate_sort_key(candidate: Candidate, intent) -> tuple:
@@ -963,9 +985,18 @@ def search_and_score(
             excluded_count,
         )
 
+    before_count = len(alive_companies)
+    alive_companies = _filter_by_intent(alive_companies, intent)
+    intent_filtered_count = before_count - len(alive_companies)
+    if intent_filtered_count:
+        logger.info(
+            "Исключено %d кандидатов детерминированным intent-фильтром",
+            intent_filtered_count,
+        )
+
     if relevance_llm_check:
         before_count = len(alive_companies)
-        alive_companies = _filter_non_listings(alive_companies, normalized.raw_query, intent)
+        alive_companies = _filter_non_listings(alive_companies, normalized.raw_query)
         filtered_count = before_count - len(alive_companies)
         if filtered_count:
             logger.info(
@@ -1213,20 +1244,16 @@ def _refine_relevance_loop(
 
         _attach_site_contacts(company, site_text, use_llm=use_llm)
         offer_text = landing_text or ""
-        landing_page_type = classify_page_type(website_entries[0].value, company.name.value, offer_text)
+        primary_candidate = company.raw_candidates[0] if company.raw_candidates else None
+        landing_title = primary_candidate.name_raw if primary_candidate else company.name.value
+        landing_page_type = classify_page_type(website_entries[0].value, landing_title, offer_text)
         product_match = (
-            match_product(intent, company.name.value, offer_text)
+            match_product(intent, landing_title, offer_text)
             if intent and intent.type == IntentType.PRODUCT
             else ProductMatch.UNKNOWN
         )
-        can_extract_product_offer = (
-            intent is None
-            or intent.type != IntentType.PRODUCT
-            or (
-                bool(landing_text)
-                and landing_page_type == PageType.PRODUCT_DETAIL
-                and product_match != ProductMatch.MISMATCH
-            )
+        can_extract_product_offer = _is_confirmed_product_offer(
+            intent, landing_page_type, product_match, landing_text
         )
         if can_extract_product_offer:
             _attach_site_price(company, offer_text, use_llm=use_llm)
@@ -1362,7 +1389,7 @@ def _refine_relevance_loop(
                     product_match,
                     offer_text,
                     company_id=company.inn,
-                    title=company.name.value,
+                    title=landing_title,
                     price_raw=company.price.value if company.price else None,
                     stock_status=company.stock_status,
                     stock_quote=company.stock_status_quote,

@@ -27,3 +27,25 @@ def test_extract_product_offer_keeps_offer_facts_with_evidence():
     assert offer.currency == "RUB"
     assert offer.attributes["квт"]["value"] == 2.5
     assert any(e.field == "price" for e in offer.evidence)
+
+
+def test_extract_product_offer_does_not_copy_unconfirmed_requested_model():
+    intent = SearchIntent(
+        type=IntentType.PRODUCT,
+        brand="Lenovo",
+        model="P16v",
+        identity_text="Lenovo ThinkPad P16v",
+    )
+
+    offer = extract_product_offer(
+        intent,
+        "https://shop.example/product/thinkpad",
+        PageType.PRODUCT_DETAIL,
+        ProductMatch.UNKNOWN,
+        "Ноутбуки Lenovo ThinkPad в наличии. Цена 100 000 руб.",
+        title="Ноутбуки Lenovo ThinkPad",
+    )
+
+    assert offer.model is None
+    assert offer.brand is None
+    assert not any(e.field == "model" for e in offer.evidence)

@@ -226,6 +226,10 @@ def _columns_for_intent(intent_type: IntentType | str | None) -> list[tuple[str,
     return _COLUMNS
 
 
+def _is_service_intent(intent_type: IntentType | str | None) -> bool:
+    return intent_type == IntentType.SERVICE or intent_type == IntentType.SERVICE.value
+
+
 def _write_header(ws: Worksheet, header_row: int, columns: list[tuple[str, int]]) -> None:
     for col_idx, (title, width) in enumerate(columns, start=1):
         cell = ws.cell(row=header_row, column=col_idx, value=title)
@@ -278,50 +282,65 @@ def export_companies_to_excel(
         price_val, price_src, price_flag = _price_summary(company, intent_type)
         stock_val, stock_quote = _stock_summary(company, intent_type)
 
-        availability = company.availability
-        found_val = _format_quantity(availability.quantity) if availability else ""
-        pack_val = _format_quantity(availability.pack_size) if availability else ""
-        min_order_val = _format_quantity(availability.min_order) if availability else ""
-        lead_time_val = (
-            availability.lead_time_days if availability and availability.lead_time_days is not None else ""
-        )
-        availability_src_val = (
-            f"{availability.source_url}, {availability.checked_at.date().isoformat()}"
-            if availability
-            else ""
-        )
-
         score = company.score
-        row = [
-            company.name.value,
-            company.inn or "",
-            company.status,
-            phone_val,
-            phone_src,
-            email_val,
-            email_src,
-            addr_val,
-            addr_src,
-            site_val,
-            site_src,
-            ", ".join(company.sources),
-            stock_val,
-            stock_quote or "",
-            _format_quantity(required_qty),
-            found_val,
-            pack_val,
-            min_order_val,
-            lead_time_val,
-            company.availability_verdict_text or "",
-            availability.evidence if availability and availability.evidence else "",
-            availability_src_val,
-            price_val,
-            price_src,
-            round(score.relevance, 3) if score else "",
-            round(score.trust, 3) if score else "",
-            round(score.confidence, 3) if score else "",
-            round(score.total, 3) if score else "",
-        ]
+        if _is_service_intent(intent_type):
+            row = _service_row(
+                company,
+                phone_val,
+                phone_src,
+                email_val,
+                email_src,
+                addr_val,
+                addr_src,
+                site_val,
+                site_src,
+                price_val,
+                price_src,
+            )
+        else:
+            availability = company.availability
+            found_val = _format_quantity(availability.quantity) if availability else ""
+            pack_val = _format_quantity(availability.pack_size) if availability else ""
+            min_order_val = _format_quantity(availability.min_order) if availability else ""
+            lead_time_val = (
+                availability.lead_time_days if availability and availability.lead_time_days is not None else ""
+            )
+            availability_src_val = (
+                f"{availability.source_url}, {availability.checked_at.date().isoformat()}"
+                if availability
+                else ""
+            )
+
+            row = [
+                company.name.value,
+                company.inn or "",
+                company.status,
+                phone_val,
+                phone_src,
+                email_val,
+                email_src,
+                addr_val,
+                addr_src,
+                site_val,
+                site_src,
+                ", ".join(company.sources),
+                stock_val,
+                stock_quote or "",
+                _format_quantity(required_qty),
+                found_val,
+                pack_val,
+                min_order_val,
+                lead_time_val,
+                company.availability_verdict_text or "",
+                availability.evidence if availability and availability.evidence else "",
+                availability_src_val,
+                price_val,
+                price_src,
+                round(score.relevance, 3) if score else "",
+                round(score.trust, 3) if score else "",
+                round(score.confidence, 3) if score else "",
+                round(score.total, 3) if score else "",
+            ]
         for col_idx, value in enumerate(row, start=1):
             ws.cell(row=row_idx, column=col_idx, value=value)
 
@@ -334,16 +353,17 @@ def export_companies_to_excel(
         ):
             ws.cell(row=row_idx, column=col_idx).fill = _FLAG_FILL[flag]
 
-        # "Наличие товара" — 13-я колонка (см. _COLUMNS): после "Источники (каталоги)".
-        stock_status = (
-            _primary_product_offer(company).stock_status
-            if (intent_type == IntentType.PRODUCT or intent_type == IntentType.PRODUCT.value)
-            and _primary_product_offer(company) is not None
-            else company.stock_status
-        )
-        ws.cell(row=row_idx, column=13).fill = _STOCK_FILL[stock_status]
+        if not _is_service_intent(intent_type):
+            # "Наличие товара" — 13-я колонка (см. _COLUMNS): после "Источники (каталоги)".
+            stock_status = (
+                _primary_product_offer(company).stock_status
+                if (intent_type == IntentType.PRODUCT or intent_type == IntentType.PRODUCT.value)
+                and _primary_product_offer(company) is not None
+                else company.stock_status
+            )
+            ws.cell(row=row_idx, column=13).fill = _STOCK_FILL[stock_status]
 
-        if company.availability_verdict is not None:
+        if not _is_service_intent(intent_type) and company.availability_verdict is not None:
             ws.cell(row=row_idx, column=_COL_AVAILABILITY_VERDICT).fill = _AVAILABILITY_FILL[
                 company.availability_verdict
             ]
@@ -358,3 +378,52 @@ def export_companies_to_excel(
     wb.save(tmp_path)
     os.replace(tmp_path, output_path)
     return output_path
+
+
+def _service_row(
+    company: Company,
+    phone_val: str,
+    phone_src: str,
+    email_val: str,
+    email_src: str,
+    addr_val: str,
+    addr_src: str,
+    site_val: str,
+    site_src: str,
+    price_val: str,
+    price_src: str,
+) -> list[object]:
+    offer = _primary_service_offer(company)
+    score = company.score
+    evidence = offer.evidence[0] if offer and offer.evidence else None
+    constraints = ", ".join(f"{key}: {value}" for key, value in (offer.constraints if offer else {}).items())
+    return [
+        company.name.value,
+        company.inn or "",
+        company.status,
+        phone_val,
+        phone_src,
+        email_val,
+        email_src,
+        addr_val,
+        addr_src,
+        site_val,
+        site_src,
+        ", ".join(company.sources),
+        offer.service_match.value if offer else "",
+        evidence.source_text if evidence else "",
+        constraints,
+        offer.service_name if offer else "",
+        offer.pricing_unit or "" if offer else "",
+        constraints,
+        offer.geography or "" if offer else "",
+        offer.service_match.value if offer else "",
+        evidence.source_text if evidence else "",
+        f"{evidence.source_url}, offer" if evidence else "",
+        price_val,
+        price_src,
+        round(score.relevance, 3) if score else "",
+        round(score.trust, 3) if score else "",
+        round(score.confidence, 3) if score else "",
+        round(score.total, 3) if score else "",
+    ]

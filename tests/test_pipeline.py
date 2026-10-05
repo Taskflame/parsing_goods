@@ -644,6 +644,43 @@ def test_relevance_llm_check_excludes_non_listing_content(monkeypatch):
     assert "Бензиновый генератор FinePower FPGI-1800 купить" in with_names
 
 
+def test_product_model_mismatch_is_filtered_without_llm(monkeypatch):
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/p16s",
+                name_raw="Lenovo ThinkPad P16s G4",
+                description_raw="Ноутбук Lenovo ThinkPad P16s в наличии",
+                website="https://shop.example/product/thinkpad-p16s",
+            ),
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/p16v",
+                name_raw="Lenovo ThinkPad P16v Gen 2",
+                description_raw="Ноутбук Lenovo ThinkPad P16v в наличии",
+                website="https://shop.example/product/thinkpad-p16v",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(pipeline, "extract_brand", lambda raw_query, **kwargs: "Lenovo")
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+
+    companies = search_and_score(
+        "Lenovo ThinkPad P16v 100 шт",
+        enricher=NullEnricher(),
+        verify_websites=True,
+        relevance_llm_check=False,
+    )
+
+    names = {company.name.value for company in companies}
+    assert "Lenovo ThinkPad P16v Gen 2" in names
+    assert "Lenovo ThinkPad P16s G4" not in names
+
+
 def test_relevance_llm_check_keeps_companies_when_llm_unavailable(monkeypatch):
     """None от classify_listing_type (LLM недоступна/упала) — компания НЕ
     исключается, в отличие от False (см. docstring classify_listing_type
@@ -1145,6 +1182,39 @@ def test_product_attribute_mismatch_does_not_create_offer_or_price(monkeypatch):
     assert companies[0].product_offers == []
 
 
+def test_product_unknown_match_does_not_create_confirmed_offer(monkeypatch):
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/thinkpad",
+                name_raw="Ноутбуки Lenovo ThinkPad",
+                description_raw="Ноутбуки Lenovo ThinkPad в наличии",
+                website="https://shop.example/product/thinkpad",
+            )
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(pipeline, "extract_brand", lambda raw_query, **kwargs: "Lenovo")
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "crawl_site_text",
+        lambda url, **kwargs: "Ноутбуки Lenovo ThinkPad. Цена 100 000 руб.",
+    )
+
+    companies = search_and_score(
+        "Lenovo ThinkPad P16v 100 шт",
+        enricher=NullEnricher(),
+        deep_relevance=True,
+    )
+
+    assert companies[0].price is None
+    assert companies[0].product_offers == []
+
+
 class _SpyEnricher(Enricher):
     """Enricher-заглушка для юнит-тестов _attach_legal_name — просто
     записывает, с каким legal_name её вызвали, без реального резолвинга."""
@@ -1631,20 +1701,20 @@ def test_check_availability_compares_order_length_against_site_meters(monkeypatc
 
     def fake_candidates(query: str) -> list[Candidate]:
         return [
-            Candidate(
-                source="yandex_search",
-                source_url="https://x.example/1",
-                name_raw="ООО Кабель",
-                description_raw="кабель ВВГ",
-                website="https://x.example",
-            ),
-        ]
+                Candidate(
+                    source="yandex_search",
+                    source_url="https://x.example/1",
+                    name_raw="Кабель ВВГ 3х2,5",
+                    description_raw="кабель ВВГ 3х2,5 в наличии",
+                    website="https://x.example/product/vvg-3x25",
+                ),
+            ]
 
     _patch_sources(monkeypatch, fake_candidates)
     monkeypatch.setattr(
         pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
     )
-    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: "кабель ВВГ, в наличии")
+    monkeypatch.setattr(pipeline, "crawl_site_text", lambda url, **kwargs: "кабель ВВГ 3х2,5, в наличии")
 
     def fake_extract_availability(product_description, site_text, source_url, units=None):
         return Availability(

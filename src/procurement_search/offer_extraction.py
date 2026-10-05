@@ -81,10 +81,15 @@ def extract_product_offer(
             source_text=_short_text(title or landing_text),
         )
     ]
-    if intent.model:
+    confirmed_model = _confirmed_model(intent, title, landing_text, product_match)
+    confirmed_attributes = _confirmed_attributes(intent, landing_text)
+
+    if confirmed_model:
         evidence.append(
-            Evidence("model", intent.model, landing_url, _snippet_around(landing_text, intent.model))
+            Evidence("model", confirmed_model, landing_url, _snippet_around(landing_text, confirmed_model))
         )
+    for unit, quantity in confirmed_attributes.items():
+        evidence.append(Evidence("attribute", quantity.raw, landing_url, _snippet_around(landing_text, quantity.raw)))
     if price_raw:
         evidence.append(Evidence("price", price_raw, landing_url, _snippet_around(landing_text, price_raw)))
     if stock_quote:
@@ -100,9 +105,9 @@ def extract_product_offer(
         page_type=page_type,
         product_match=product_match,
         product_name=title,
-        brand=intent.brand,
-        model=intent.model,
-        attributes={unit: _quantity_to_dict(qty) for unit, qty in intent.attributes.items()},
+        brand=intent.brand if confirmed_model or confirmed_attributes else None,
+        model=confirmed_model,
+        attributes={unit: _quantity_to_dict(qty) for unit, qty in confirmed_attributes.items()},
         price=parse_price_value(price_raw),
         currency=price_currency(price_raw),
         stock_status=stock_status,
@@ -150,6 +155,33 @@ def extract_service_offer(
 
 def _quantity_to_dict(quantity: Quantity) -> dict[str, object]:
     return {"value": quantity.value, "unit": quantity.unit, "raw": quantity.raw}
+
+
+def _confirmed_model(
+    intent: SearchIntent,
+    title: str | None,
+    landing_text: str,
+    product_match: ProductMatch,
+) -> str | None:
+    if product_match != ProductMatch.EXACT or not intent.model:
+        return None
+    haystack = " ".join(part for part in (title or "", landing_text) if part)
+    return intent.model if _contains_phrase(haystack, intent.model) else None
+
+
+def _confirmed_attributes(intent: SearchIntent, landing_text: str) -> dict[str, Quantity]:
+    confirmed: dict[str, Quantity] = {}
+    lowered = landing_text.lower()
+    for unit, quantity in intent.attributes.items():
+        if quantity.raw.lower() in lowered:
+            confirmed[unit] = quantity
+        elif quantity.unit == "квт" and f"{int(quantity.value * 1000)} вт" in lowered:
+            confirmed[unit] = quantity
+    return confirmed
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    return re.search(rf"(?<![a-zа-яё0-9]){re.escape(phrase)}(?![a-zа-яё0-9])", text, re.IGNORECASE) is not None
 
 
 def _short_text(text: str | None, limit: int = 160) -> str | None:
