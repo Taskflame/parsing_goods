@@ -9,8 +9,13 @@ from procurement_search.models import (
     Availability,
     AvailabilityStatus,
     Company,
+    Evidence,
     FieldValue,
+    IntentType,
     LEGAL_ADDRESS,
+    PageType,
+    ProductMatch,
+    ProductOffer,
     VerificationFlag,
 )
 from procurement_search.quantity_match import Verdict
@@ -44,6 +49,56 @@ def test_export_without_availability_keeps_header_at_row_one(tmp_path):
     ws = wb.active
     assert ws.cell(row=1, column=1).value == "Компания"
     assert ws.cell(row=2, column=1).value == "ООО Тест"
+
+
+def test_export_service_intent_uses_service_headers(tmp_path):
+    output = export_companies_to_excel(
+        [_company("ООО Утилизация")],
+        tmp_path / "service.xlsx",
+        intent_type=IntentType.SERVICE,
+    )
+
+    wb = openpyxl.load_workbook(output)
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+
+    assert headers[0] == "Исполнитель"
+    assert "Соответствие услуге" in headers
+    assert "Наличие товара" not in headers
+    assert "Цена / тариф" in headers
+
+
+def test_export_product_intent_uses_offer_price_when_company_price_missing(tmp_path):
+    company = _company("ООО Оффер")
+    company.product_offers.append(
+        ProductOffer(
+            company_id=None,
+            landing_url="https://shop.example/product",
+            page_type=PageType.PRODUCT_DETAIL,
+            product_match=ProductMatch.COMPATIBLE,
+            price=50000.0,
+            currency="RUB",
+            evidence=[
+                Evidence(
+                    field="price",
+                    value="50 000 руб.",
+                    source_url="https://shop.example/product",
+                    source_text="Цена 50 000 руб.",
+                )
+            ],
+        )
+    )
+
+    output = export_companies_to_excel(
+        [company],
+        tmp_path / "offer-price.xlsx",
+        intent_type=IntentType.PRODUCT,
+    )
+
+    wb = openpyxl.load_workbook(output)
+    ws = wb.active
+    assert ws.cell(row=2, column=23).value == "50 000 руб."
+    assert "shop.example/product" in ws.cell(row=2, column=24).value
 
 
 def test_export_with_summary_shifts_header_down_and_writes_summary_row(tmp_path):

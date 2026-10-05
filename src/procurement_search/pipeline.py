@@ -14,6 +14,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 from procurement_search.attribute_extractor import COUNT_UNITS, Quantity, classify_roles, extract_attributes
 from procurement_search.availability import extract_availability as extract_product_availability
@@ -29,15 +30,31 @@ from procurement_search.config import (
 from procurement_search.dedup import dedup_candidates
 from procurement_search.enrichment import DadataEnricher, Enricher, NullEnricher
 from procurement_search.export import export_companies_to_excel
+from procurement_search.intent import (
+    build_search_terms,
+    classify_page_type,
+    match_product,
+    match_service,
+    parse_intent,
+)
 from procurement_search.models import (
     ACTUAL_ADDRESS,
     Candidate,
     Company,
     FieldValue,
+    IntentType,
+    PageType,
+    ProductMatch,
     ScoreBreakdown,
+    ServiceMatch,
     StockStatus,
     VerificationFlag,
 )
+from procurement_search.offer_extraction import (
+    extract_product_offer,
+    extract_service_offer,
+)
+from procurement_search.product_category_resolver import resolve_product_category_links
 from procurement_search.query_normalizer import normalize_query
 from procurement_search.query_kernel import condense_query
 from procurement_search.quantity_match import (
@@ -117,11 +134,13 @@ class SearchResult(list):
         order_qty: Quantity | None = None,
         order_length: Quantity | None = None,
         product_description: str | None = None,
+        intent_type: IntentType = IntentType.PRODUCT,
     ):
         super().__init__(companies)
         self.order_qty = order_qty
         self.order_length = order_length
         self.product_description = product_description
+        self.intent_type = intent_type
 
     def effective_order_amount(self) -> Quantity | None:
         """Что сравнивать с остатком на сайте кандидата (Слой 4, экспорт,
@@ -169,6 +188,11 @@ _MIN_TRUSTED_CANDIDATES_TO_SKIP_GLOBAL_SEARCH = 3
 # то, что топ-1 не даёт узнать в принципе (см. trusted_suppliers.py).
 _TRUSTED_SUPPLIERS_WRITE_BACK_TOP_N = 3
 
+# PRODUCT category resolver: сколько страниц-категорий раскрывать за один
+# прогон. Сначала пробуем локально вытащить ссылки из HTML категории, затем
+# оставляем site-search fallback для сайтов, где ссылки не видны в статике.
+_MAX_PRODUCT_CATEGORY_DOMAINS_TO_RESOLVE = 5
+
 # Ключи, при которых Слой 3 (LLM) снижает relevance, а не обнуляет её —
 # один неверный вердикт модели не должен полностью убить кандидата,
 # которого Слои 1-2 честно нашли по реальному тексту сайта.
@@ -189,6 +213,7 @@ _STOCK_STATUS_MAP = {
     "in_stock": StockStatus.IN_STOCK,
     "clarify": StockStatus.CLARIFY,
     "out_of_stock": StockStatus.OUT_OF_STOCK,
+    "unknown": StockStatus.NOT_CHECKED,
 }
 
 
@@ -218,10 +243,30 @@ def _parse_price_value(raw: str) -> float | None:
     return value if value > 0 else None
 
 
+def _offer_price_value(company: Company) -> float | None:
+    if company.product_offers and company.product_offers[0].price is not None:
+        return company.product_offers[0].price
+    if company.service_offers and company.service_offers[0].price is not None:
+        return company.service_offers[0].price
+    return None
+
+
+def _company_or_offer_price_value(company: Company) -> float | None:
+    offer_price = _offer_price_value(company)
+    if offer_price is not None:
+        return offer_price
+    return _parse_price_value(company.price.value) if company.price else None
+
+
 def _ranking_key(
-    company: Company, marketplace_domains: list[str]
-) -> tuple[bool, int, bool, float, float]:
-    """Пятиуровневая сортировка (по возрастанию):
+    company: Company, marketplace_domains: list[str], intent=None
+) -> tuple:
+    """Сортировка (по возрастанию).
+
+    Для PRODUCT-запросов поверх старой логики добавляется более строгий
+    префикс: ProductMatch -> PageType -> score. Так цена не может поднять
+    похожую, но неверную модель выше подтверждённой карточки нужного
+    товара. Для остальных intent сохраняется прежняя price-first сортировка:
       1. сначала не-маркетплейсы, потом маркетплейсы (см. is_marketplace_domain
          в scoring.py) — маркетплейсы не выкидываются из выдачи, а
          гарантированно оказываются НИЖЕ любого не-маркетплейса независимо
@@ -277,11 +322,36 @@ def _ranking_key(
     search_and_score — значит и бюджет краулинга Слоя 2/3 не тратится на
     маркетплейсы, пока есть чем его заполнить без них."""
     score = company.score.total if company.score else 0.0
-    price_value = _parse_price_value(company.price.value) if company.price else None
+    price_value = _company_or_offer_price_value(company)
     if company.availability_verdict is not None:
         verdict_priority = VERDICT_SORT_ORDER[Verdict(company.availability_verdict)]
     else:
         verdict_priority = VERDICT_SORT_ORDER[Verdict.UNKNOWN]
+    if intent is not None and intent.type == IntentType.PRODUCT:
+        primary = company.raw_candidates[0] if company.raw_candidates else None
+        page_type = _candidate_page_type(primary)
+        product_match = _candidate_product_match(primary, intent)
+        match_priority = {
+            ProductMatch.EXACT: 0,
+            ProductMatch.COMPATIBLE: 1,
+            ProductMatch.UNKNOWN: 2,
+            ProductMatch.MISMATCH: 3,
+        }[product_match]
+        page_priority = {
+            PageType.PRODUCT_DETAIL: 0,
+            PageType.PRODUCT_CATEGORY: 1,
+            PageType.COMPANY_HOME: 2,
+            PageType.DIRECTORY: 3,
+        }.get(page_type, 4)
+        return (
+            is_marketplace_domain(company, marketplace_domains),
+            match_priority,
+            page_priority,
+            -score,
+            verdict_priority,
+            price_value is None,
+            price_value if price_value is not None else 0.0,
+        )
     return (
         is_marketplace_domain(company, marketplace_domains),
         price_value is None,
@@ -322,7 +392,7 @@ def _is_knockout(company: Company) -> bool:
     return company.status in DEAD_COMPANY_STATUSES
 
 
-def _filter_non_listings(companies: list[Company], raw_query: str) -> list[Company]:
+def _filter_non_listings(companies: list[Company], raw_query: str, intent=None) -> list[Company]:
     """LLM-фильтр по заголовку+сниппету (design-обсуждение: в выдаче
     попадались статьи/видео/обзоры — "Как работает портативный генератор"
     на rutube.ru, "Белый список производителей" на блоге — у которых
@@ -345,11 +415,71 @@ def _filter_non_listings(companies: list[Company], raw_query: str) -> list[Compa
     for company in companies:
         primary = company.raw_candidates[0] if company.raw_candidates else None
         snippet = primary.description_raw if primary else None
+        page_type = _candidate_page_type(primary)
+        if intent is not None and intent.type == IntentType.PRODUCT:
+            if page_type in {PageType.SERVICE_DETAIL, PageType.SERVICE_CATEGORY, PageType.DIRECTORY, PageType.CONTENT}:
+                continue
+            if _candidate_product_match(primary, intent) == ProductMatch.MISMATCH:
+                continue
+        elif intent is not None and intent.type == IntentType.SERVICE:
+            if page_type in {PageType.PRODUCT_DETAIL, PageType.PRODUCT_CATEGORY, PageType.DIRECTORY, PageType.CONTENT}:
+                continue
+            if match_service(intent, company.name.value, snippet) == ServiceMatch.MISMATCH:
+                continue
         verdict = classify_listing_type(raw_query, company.name.value, snippet)
         if verdict is False:
             continue
         kept.append(company)
     return kept
+
+
+def _candidate_page_type(candidate: Candidate | None) -> PageType:
+    if candidate is None:
+        return PageType.UNKNOWN
+    return classify_page_type(candidate.website or candidate.source_url, candidate.name_raw, candidate.description_raw)
+
+
+def _candidate_product_match(candidate: Candidate | None, intent) -> ProductMatch:
+    if candidate is None:
+        return ProductMatch.UNKNOWN
+    return match_product(intent, candidate.name_raw, candidate.description_raw)
+
+
+def _candidate_sort_key(candidate: Candidate, intent) -> tuple:
+    page_type = _candidate_page_type(candidate)
+    if intent.type == IntentType.PRODUCT:
+        product_match = _candidate_product_match(candidate, intent)
+        match_priority = {
+            ProductMatch.EXACT: 0,
+            ProductMatch.COMPATIBLE: 1,
+            ProductMatch.UNKNOWN: 2,
+            ProductMatch.MISMATCH: 3,
+        }[product_match]
+        page_priority = {
+            PageType.PRODUCT_DETAIL: 0,
+            PageType.PRODUCT_CATEGORY: 1,
+            PageType.COMPANY_HOME: 2,
+            PageType.DIRECTORY: 3,
+        }.get(page_type, 4)
+        return (match_priority, page_priority, -(len(candidate.description_raw or "") + len(candidate.name_raw)))
+    service_match = match_service(intent, candidate.name_raw, candidate.description_raw)
+    service_priority = {"match": 0, "partial": 1, "unknown": 2, "mismatch": 3}[service_match.value]
+    page_priority = {
+        PageType.SERVICE_DETAIL: 0,
+        PageType.SERVICE_CATEGORY: 1,
+        PageType.COMPANY_HOME: 2,
+    }.get(page_type, 3)
+    return (service_priority, page_priority, -(len(candidate.description_raw or "") + len(candidate.name_raw)))
+
+
+def _sort_candidate_group_for_intent(group: list[Candidate], intent) -> list[Candidate]:
+    """Keeps all evidence URLs, but moves the best landing URL to index 0.
+
+    Existing enrichers use candidate_group[0] as the display/source anchor;
+    sorting here removes the old first-result bias without changing their
+    public interface.
+    """
+    return sorted(group, key=lambda c: _candidate_sort_key(c, intent))
 
 
 def _default_enricher() -> Enricher:
@@ -385,6 +515,83 @@ def _search_trusted_suppliers(
             )
             found.extend(candidates)
     return found
+
+
+def _domain_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return None
+    return parsed.netloc.removeprefix("www.").lower()
+
+
+def _product_identity_for_site_search(intent, fallback: str) -> str:
+    if intent.brand and intent.model:
+        return f'"{intent.brand} {intent.model}"'
+    if intent.model:
+        return f'"{intent.model}"'
+    parts = [fallback]
+    for qty in intent.attributes.values():
+        parts.append(qty.raw)
+        if qty.unit == "квт":
+            parts.append(f"{int(qty.value * 1000)} Вт")
+    return " ".join(dict.fromkeys(p for p in parts if p))
+
+
+def _resolve_product_category_candidates(
+    candidates: list[Candidate],
+    sources: list,
+    intent,
+    clean_query_text: str,
+) -> list[Candidate]:
+    """Раскрывает товарные категории в более точные карточки товара.
+
+    Категория/каталог остаётся lead-страницей, но не финальным ProductOffer:
+    мы пробуем найти внутри того же домена более точную карточку товара и
+    возвращаем дополнительные кандидаты в общий пул до dedup/scoring.
+    """
+    if intent.type != IntentType.PRODUCT:
+        return []
+
+    category_candidates: list[Candidate] = []
+    domains: list[str] = []
+    for candidate in candidates:
+        if _candidate_page_type(candidate) != PageType.PRODUCT_CATEGORY:
+            continue
+        category_candidates.append(candidate)
+        domain = _domain_from_url(candidate.website or candidate.source_url)
+        if domain and domain not in domains:
+            domains.append(domain)
+        if len(category_candidates) >= _MAX_PRODUCT_CATEGORY_DOMAINS_TO_RESOLVE:
+            break
+
+    if not category_candidates:
+        return []
+
+    resolved: list[Candidate] = []
+    for candidate in category_candidates:
+        found = resolve_product_category_links(candidate, intent, clean_query_text)
+        logger.info(
+            "%d кандидатов найдено внутри товарной категории '%s'",
+            len(found),
+            candidate.website or candidate.source_url,
+        )
+        resolved.extend(found)
+
+    identity = _product_identity_for_site_search(intent, clean_query_text)
+    for source in sources:
+        for domain in domains:
+            query = f"site:{domain} {identity}"
+            found = source.search(query)
+            logger.info(
+                "%s: %d кандидатов при раскрытии товарного каталога '%s'",
+                source.name,
+                len(found),
+                query,
+            )
+            resolved.extend(found)
+    return resolved
 
 
 def search_and_score(
@@ -555,6 +762,13 @@ def search_and_score(
     parsed_query = classify_roles(
         query_extraction, normalized.raw_query, brand, units_cfg, spec_ranges=load_spec_ranges()
     )
+    intent = parse_intent(
+        normalized.raw_query,
+        parsed_query=parsed_query,
+        extraction=query_extraction,
+        brand=brand,
+    )
+    logger.info("Intent: %s", intent.type.value)
     if parsed_query.conflicts:
         for conflict in parsed_query.conflicts:
             logger.info("Слой 0.6: %s", conflict)
@@ -704,28 +918,25 @@ def search_and_score(
         # search_raw_query, а не normalized.raw_query — с вырезанным order_qty
         # (см. выше про то, почему количество закупки не должно уходить в
         # поисковый запрос); при order_qty=None это просто raw_query как раньше.
-        extra_terms = [clean_query_text]
-        if brand:
-            without_brand = re.sub(re.escape(brand), "", clean_query_text, flags=re.IGNORECASE)
-            without_brand = re.sub(r"\s+", " ", without_brand).strip()
-            brand_first_term = f"{brand} {without_brand}".strip() if without_brand else brand
-            extra_terms.insert(0, brand_first_term)
-        # Слой 0 (query_kernel.py, см. выше kernel): сжатое ядро длинного
-        # шаблонного запроса — короткая осмысленная формулировка, понятная
-        # поисковику без юридической каши. Добавляется как отдельный термин.
-        # Длинный raw_query при этом НЕ выбрасывается: раз есть ядро, разрешаем
-        # до 4 поисковых запросов к источнику вместо 3, чтобы ушли и ядро, и
-        # полный оригинал (ничего не теряется, дедуп всё равно схлопнется).
-        if kernel:
-            extra_terms.insert(0, kernel)
-        max_terms = 4 if kernel else 3
-        search_terms = list(dict.fromkeys([search_raw_query, *extra_terms]))
+        search_terms = build_search_terms(search_raw_query, intent, clean_query_text, brand, kernel)
+        # Для товарных запросов первые проходы ориентированы на карточку
+        # товара ("модель" купить/цена/в наличии), а не на объём закупки.
+        # Для услуг остаётся более широкий поиск исполнителя.
+        product_needs_detail_pass = bool(
+            intent.type == IntentType.PRODUCT and (intent.model or intent.attributes)
+        )
+        max_terms = 5 if product_needs_detail_pass else (4 if kernel else 3)
         for source in sources:
-            # raw_query + (ядро) + бренд-термин + clean_text, не больше max_terms
+            # intent-aware термины, не больше max_terms
             for term in search_terms[:max_terms]:
                 found = source.search(term)
                 logger.info("%s: %d кандидатов по запросу '%s'", source.name, len(found), term)
                 candidates.extend(found)
+
+        resolved_from_categories = _resolve_product_category_candidates(
+            candidates, sources, intent, clean_query_text
+        )
+        candidates.extend(resolved_from_categories)
 
     if not candidates:
         logger.warning(
@@ -733,7 +944,7 @@ def search_and_score(
             "Yandex gen-search) не настроен или недоступен из этой сети (см. README.md)."
         )
 
-    groups = dedup_candidates(candidates)
+    groups = [_sort_candidate_group_for_intent(group, intent) for group in dedup_candidates(candidates)]
     logger.info("После дедупликации: %d уникальных компаний из %d кандидатов", len(groups), len(candidates))
 
     companies: list[Company] = []
@@ -754,7 +965,7 @@ def search_and_score(
 
     if relevance_llm_check:
         before_count = len(alive_companies)
-        alive_companies = _filter_non_listings(alive_companies, normalized.raw_query)
+        alive_companies = _filter_non_listings(alive_companies, normalized.raw_query, intent)
         filtered_count = before_count - len(alive_companies)
         if filtered_count:
             logger.info(
@@ -784,7 +995,7 @@ def search_and_score(
             "явно не совпадает с сайтом кандидата",
             mismatch_count,
         )
-    alive_companies.sort(key=lambda c: _ranking_key(c, marketplace_domains))
+    alive_companies.sort(key=lambda c: _ranking_key(c, marketplace_domains, intent))
 
     if deep_relevance:
         _refine_relevance(
@@ -799,6 +1010,7 @@ def search_and_score(
             order_qty=_effective_order_amount(parsed_query.order_qty, parsed_query.order_length),
             units=units_cfg,
             probe_stepper=probe_stepper,
+            intent=intent,
         )
         # Слой 2 мог дорезолвить компанию в ЕГРЮЛ по названию юрлица со
         # своего же сайта (см. _attach_legal_name) и обнаружить, что она
@@ -836,7 +1048,7 @@ def search_and_score(
                     before_oos - len(alive_companies),
                 )
 
-        alive_companies.sort(key=lambda c: _ranking_key(c, marketplace_domains))
+        alive_companies.sort(key=lambda c: _ranking_key(c, marketplace_domains, intent))
     elif check_availability or probe_stepper:
         logger.warning(
             "check_availability=True/probe_stepper=True требуют deep_relevance=True (нечего "
@@ -876,6 +1088,7 @@ def search_and_score(
         order_qty=parsed_query.order_qty,
         order_length=parsed_query.order_length,
         product_description=parsed_query.product,
+        intent_type=intent.type,
     )
 
 
@@ -892,6 +1105,7 @@ def _refine_relevance(
     # штучное количество ИЛИ метраж, что нашлось в запросе (см. pipeline._effective_order_amount)
     units: dict | None = None,
     probe_stepper: bool = False,
+    intent=None,
 ) -> None:
     """Слои 2-4 уточнения релевантности (design-обсуждение скоринга) — на
     входе уже отранжированный по грубому Слою-1-скору срез top-N, не вся
@@ -943,6 +1157,7 @@ def _refine_relevance(
             order_qty=order_qty,
             units=units,
             browser=browser,
+            intent=intent,
         )
     finally:
         if browser is not None:
@@ -974,6 +1189,7 @@ def _refine_relevance_loop(
     order_qty: Quantity | None,  # эффективная цель — см. _effective_order_amount
     units: dict | None,
     browser,
+    intent=None,
 ) -> None:
     no_website = 0
     crawl_failed = 0
@@ -983,6 +1199,7 @@ def _refine_relevance_loop(
             no_website += 1
             continue
 
+        landing_text = crawl_site_text(website_entries[0].value, max_pages=1)
         site_text = crawl_site_text(website_entries[0].value)
         if site_text is None:
             crawl_failed += 1
@@ -995,10 +1212,34 @@ def _refine_relevance_loop(
             continue
 
         _attach_site_contacts(company, site_text, use_llm=use_llm)
-        _attach_site_price(company, site_text, use_llm=use_llm)
+        offer_text = landing_text or ""
+        landing_page_type = classify_page_type(website_entries[0].value, company.name.value, offer_text)
+        product_match = (
+            match_product(intent, company.name.value, offer_text)
+            if intent and intent.type == IntentType.PRODUCT
+            else ProductMatch.UNKNOWN
+        )
+        can_extract_product_offer = (
+            intent is None
+            or intent.type != IntentType.PRODUCT
+            or (
+                bool(landing_text)
+                and landing_page_type == PageType.PRODUCT_DETAIL
+                and product_match != ProductMatch.MISMATCH
+            )
+        )
+        if can_extract_product_offer:
+            _attach_site_price(company, offer_text, use_llm=use_llm)
+        elif company.price is not None:
+            company.price = None
         _attach_legal_name(company, site_text, enricher, use_llm=use_llm)
 
         relevance = compute_site_relevance(tokens, site_text)
+        if intent is not None and intent.type == IntentType.PRODUCT:
+            if product_match == ProductMatch.MISMATCH:
+                relevance = 0.0
+            elif landing_page_type == PageType.PRODUCT_CATEGORY:
+                relevance *= 0.7
 
         if use_llm:
             verdict = classify_relevance(raw_query, site_text)
@@ -1029,7 +1270,10 @@ def _refine_relevance_loop(
             # CLARIFY. stock_status_quote — дословная фраза с сайта рядом с
             # категорией, чтобы байер видел не только вывод модели, а и то,
             # на основании чего он сделан.
-            stock_result = classify_stock_status(site_text)
+            stock_result = None
+            if intent is None or intent.type != IntentType.PRODUCT or can_extract_product_offer:
+                stock_text = offer_text if intent is not None and intent.type == IntentType.PRODUCT else site_text
+                stock_result = classify_stock_status(stock_text)
             if stock_result is not None:
                 status, quote = stock_result
                 company.stock_status = _STOCK_STATUS_MAP[status]
@@ -1037,7 +1281,7 @@ def _refine_relevance_loop(
             # None (LLM недоступна/упала) — stock_status остаётся
             # NOT_CHECKED, не выдумываем результат.
 
-        if check_availability:
+        if check_availability and can_extract_product_offer:
             # Слой 4 (models.Availability, quantity_match.py) — отдельный
             # от use_llm флаг (не завязан на relevance_llm_check, см.
             # search_and_score про мотивацию раздельной стоимости).
@@ -1046,7 +1290,7 @@ def _refine_relevance_loop(
             # количеством закупки, которого на странице кандидата и не
             # может быть.
             availability = extract_product_availability(
-                product_description or raw_query, site_text, website_entries[0].value, units
+                product_description or raw_query, offer_text, website_entries[0].value, units
             )
             company.availability = availability
             verdict, verdict_text = compare_quantity(order_qty, availability)
@@ -1108,6 +1352,38 @@ def _refine_relevance_loop(
                     # Не наоборот: probe_result=None (степпер не найден/страница
                     # не открылась) оставляет вердикт Слоя 4 как есть — "нет
                     # данных от пробинга" не значит "нет данных вообще".
+
+        if intent is not None and intent.type == IntentType.PRODUCT and can_extract_product_offer:
+            company.product_offers = [
+                extract_product_offer(
+                    intent,
+                    website_entries[0].value,
+                    landing_page_type,
+                    product_match,
+                    offer_text,
+                    company_id=company.inn,
+                    title=company.name.value,
+                    price_raw=company.price.value if company.price else None,
+                    stock_status=company.stock_status,
+                    stock_quote=company.stock_status_quote,
+                    availability=company.availability,
+                )
+            ]
+        elif intent is not None and intent.type == IntentType.SERVICE:
+            service_match = match_service(intent, company.name.value, site_text)
+            if service_match != ServiceMatch.MISMATCH:
+                company.service_offers = [
+                    extract_service_offer(
+                        intent,
+                        website_entries[0].value,
+                        landing_page_type,
+                        service_match,
+                        site_text,
+                        company_id=company.inn,
+                        title=company.name.value,
+                        price_raw=company.price.value if company.price else None,
+                    )
+                ]
 
         # trust/confidence пересчитываются заново, не берутся из старого
         # company.score — _attach_legal_name выше мог только что дорезолвить
@@ -1423,7 +1699,13 @@ def run_pipeline(
     )
     effective_amount = result.effective_order_amount()
     summary = summarize_availability(result, effective_amount)
-    return export_companies_to_excel(result, output_path, required_qty=effective_amount, summary=summary)
+    return export_companies_to_excel(
+        result,
+        output_path,
+        required_qty=effective_amount,
+        summary=summary,
+        intent_type=result.intent_type,
+    )
 
 
 # --- Заметки на будущее (перенесены из llm_classifier.py при его удалении) ---

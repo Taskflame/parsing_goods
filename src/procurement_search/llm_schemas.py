@@ -83,7 +83,7 @@ class QueryKernelGuess(BaseModel):
 
 
 class StockVerdict(BaseModel):
-    status: Literal["in_stock", "clarify", "out_of_stock"]
+    status: Literal["in_stock", "clarify", "out_of_stock", "unknown"]
     quote: str | None
     reasoning: str
 

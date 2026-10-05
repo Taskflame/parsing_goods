@@ -190,7 +190,13 @@ def _run_search_job(job_id: str, payload_kwargs: dict, email: str | None = None)
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now()
         filename = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{_slugify(query)}_{uuid.uuid4().hex[:8]}.xlsx"
-        export_companies_to_excel(result, REPORTS_DIR / filename, required_qty=effective_amount, summary=summary)
+        export_companies_to_excel(
+            result,
+            REPORTS_DIR / filename,
+            required_qty=effective_amount,
+            summary=summary,
+            intent_type=result.intent_type,
+        )
 
         entry = {
             "filename": filename,
@@ -210,6 +216,7 @@ def _run_search_job(job_id: str, payload_kwargs: dict, email: str | None = None)
         result_payload = {
             "report": entry,
             "companies": [_company_to_dict(c) for c in result],
+            "intent_type": result.intent_type.value,
             "required_quantity": required_quantity,
             "availability_summary": summary,
             "query_used": query,
@@ -293,8 +300,54 @@ def _single_field_to_dict(fv: FieldValue | None) -> dict | None:
     }
 
 
+def _evidence_to_dict(evidence) -> dict:
+    return {
+        "field": evidence.field,
+        "value": evidence.value,
+        "source_url": evidence.source_url,
+        "source_text": evidence.source_text,
+    }
+
+
+def _product_offer_to_dict(offer) -> dict:
+    return {
+        "landing_url": offer.landing_url,
+        "page_type": offer.page_type.value,
+        "product_match": offer.product_match.value,
+        "product_name": offer.product_name,
+        "brand": offer.brand,
+        "model": offer.model,
+        "sku": offer.sku,
+        "attributes": offer.attributes,
+        "price": offer.price,
+        "currency": offer.currency,
+        "stock_status": offer.stock_status.value,
+        "stock_quantity": offer.stock_quantity,
+        "evidence": [_evidence_to_dict(e) for e in offer.evidence],
+    }
+
+
+def _service_offer_to_dict(offer) -> dict:
+    return {
+        "landing_url": offer.landing_url,
+        "page_type": offer.page_type.value,
+        "service_match": offer.service_match.value,
+        "service_name": offer.service_name,
+        "description": offer.description,
+        "geography": offer.geography,
+        "constraints": offer.constraints,
+        "price": offer.price,
+        "currency": offer.currency,
+        "pricing_unit": offer.pricing_unit,
+        "evidence": [_evidence_to_dict(e) for e in offer.evidence],
+    }
+
+
 def _company_to_dict(company: Company) -> dict:
     score = company.score
+    product_offers = [_product_offer_to_dict(o) for o in company.product_offers]
+    service_offers = [_service_offer_to_dict(o) for o in company.service_offers]
+    primary_offer = product_offers[0] if product_offers else (service_offers[0] if service_offers else None)
     return {
         "name": company.name.value,
         "inn": company.inn,
@@ -324,6 +377,9 @@ def _company_to_dict(company: Company) -> dict:
         "availability_verdict": company.availability_verdict,
         "availability_verdict_text": company.availability_verdict_text,
         "price": _single_field_to_dict(company.price),
+        "product_offers": product_offers,
+        "service_offers": service_offers,
+        "primary_offer": primary_offer,
         "score": (
             {
                 "relevance": round(score.relevance, 3),

@@ -53,6 +53,91 @@ class AvailabilityStatus(str, Enum):
     UNKNOWN = "нет данных"
 
 
+class IntentType(str, Enum):
+    PRODUCT = "product"
+    SERVICE = "service"
+
+
+class PageType(str, Enum):
+    PRODUCT_DETAIL = "product_detail"
+    PRODUCT_CATEGORY = "product_category"
+    SERVICE_DETAIL = "service_detail"
+    SERVICE_CATEGORY = "service_category"
+    COMPANY_HOME = "company_home"
+    DIRECTORY = "directory"
+    CONTENT = "content"
+    UNKNOWN = "unknown"
+
+
+class ProductMatch(str, Enum):
+    EXACT = "exact"
+    COMPATIBLE = "compatible"
+    UNKNOWN = "unknown"
+    MISMATCH = "mismatch"
+
+
+class ServiceMatch(str, Enum):
+    MATCH = "match"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+    MISMATCH = "mismatch"
+
+
+@dataclass(frozen=True)
+class SearchIntent:
+    type: IntentType
+    entity: str | None = None
+    service: str | None = None
+    brand: str | None = None
+    model: str | None = None
+    quantity: Quantity | None = None
+    attributes: dict[str, Quantity] = field(default_factory=dict)
+    hard_constraints: dict[str, object] = field(default_factory=dict)
+    soft_constraints: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Evidence:
+    field: str
+    value: str | None
+    source_url: str
+    source_text: str | None = None
+
+
+@dataclass
+class ProductOffer:
+    company_id: str | None
+    landing_url: str
+    page_type: PageType
+    product_match: ProductMatch
+    product_name: str | None = None
+    brand: str | None = None
+    model: str | None = None
+    sku: str | None = None
+    attributes: dict[str, object] = field(default_factory=dict)
+    price: float | None = None
+    currency: str | None = None
+    stock_status: StockStatus = StockStatus.NOT_CHECKED
+    stock_quantity: int | None = None
+    evidence: list[Evidence] = field(default_factory=list)
+
+
+@dataclass
+class ServiceOffer:
+    company_id: str | None
+    landing_url: str
+    page_type: PageType
+    service_match: ServiceMatch
+    service_name: str | None = None
+    description: str | None = None
+    geography: str | None = None
+    constraints: dict[str, object] = field(default_factory=dict)
+    price: float | None = None
+    currency: str | None = None
+    pricing_unit: str | None = None
+    evidence: list[Evidence] = field(default_factory=list)
+
+
 @dataclass
 class Availability:
     """Наличие товара на сайте кандидата с числом (если опубликовано) —
@@ -189,3 +274,11 @@ class Company:
     # Готовый текст для колонки Excel/веб-таблицы (quantity_match.compare),
     # например "Недостаточно — есть всего 10 шт из 11".
     availability_verdict_text: str | None = None
+
+    # Новая offer-модель поверх старого Company API. Пока Company.price /
+    # stock_status / availability сохраняются для обратной совместимости
+    # export.py/webapp.py, но конкретные подтверждённые предложения уже
+    # складываются отдельно: компания отвечает на вопрос "кто", offer —
+    # "что именно подтверждено и на какой странице".
+    product_offers: list[ProductOffer] = field(default_factory=list)
+    service_offers: list[ServiceOffer] = field(default_factory=list)

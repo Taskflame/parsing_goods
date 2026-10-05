@@ -16,7 +16,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
 from procurement_search.attribute_extractor import Quantity
-from procurement_search.models import Company, LEGAL_ADDRESS, StockStatus, VerificationFlag
+from procurement_search.models import Company, IntentType, LEGAL_ADDRESS, StockStatus, VerificationFlag
 from procurement_search.quantity_match import Verdict
 
 _HEADER_FILL = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
@@ -92,6 +92,37 @@ _COLUMNS = [
     ("Score: итого", 12),
 ]
 
+_SERVICE_COLUMNS = [
+    ("Исполнитель", 32),
+    ("ИНН", 14),
+    ("Статус юрлица", 18),
+    ("Телефон", 20),
+    ("Телефон: источник/дата", 26),
+    ("Email", 24),
+    ("Email: источник/дата", 26),
+    ("Адрес", 30),
+    ("Адрес: источник/дата", 26),
+    ("Сайт", 26),
+    ("Сайт: источник/дата", 26),
+    ("Источники", 20),
+    ("Соответствие услуге", 18),
+    ("Услуга: подтверждение", 30),
+    ("Ограничение", 14),
+    ("Подтверждено", 16),
+    ("Тариф / единица", 16),
+    ("Ограничения", 14),
+    ("Срок / география", 14),
+    ("Соответствие требованиям", 30),
+    ("Evidence", 30),
+    ("Evidence: источник/дата", 26),
+    ("Цена / тариф", 16),
+    ("Цена / тариф: источник/дата", 26),
+    ("Score: релевантность", 12),
+    ("Score: доверие", 12),
+    ("Score: полнота данных", 14),
+    ("Score: итого", 12),
+]
+
 # Индексы (1-based) новых колонок — см. _COLUMNS выше, "Запрошено" первая
 # из восьми, вставленных между "Наличие товара: цитата с сайта" (14) и
 # "Цена" (сдвинулась с 15 на 23).
@@ -143,8 +174,60 @@ def _single_field_summary(fv) -> tuple[str, str, VerificationFlag]:
     return fv.value, f"{fv.source}, {fv.retrieved_at.isoformat()}", fv.confidence
 
 
-def _write_header(ws: Worksheet, header_row: int) -> None:
-    for col_idx, (title, width) in enumerate(_COLUMNS, start=1):
+def _primary_product_offer(company: Company):
+    return company.product_offers[0] if company.product_offers else None
+
+
+def _primary_service_offer(company: Company):
+    return company.service_offers[0] if company.service_offers else None
+
+
+def _offer_price_raw(offer) -> str | None:
+    if offer is None:
+        return None
+    for evidence in offer.evidence:
+        if evidence.field == "price" and evidence.value:
+            return evidence.value
+    if offer.price is not None:
+        suffix = f" {offer.currency}" if offer.currency else ""
+        return f"{offer.price:g}{suffix}"
+    return None
+
+
+def _price_summary(company: Company, intent_type: IntentType | str | None) -> tuple[str, str, VerificationFlag]:
+    if intent_type == IntentType.PRODUCT or intent_type == IntentType.PRODUCT.value:
+        offer = _primary_product_offer(company)
+    elif intent_type == IntentType.SERVICE or intent_type == IntentType.SERVICE.value:
+        offer = _primary_service_offer(company)
+    else:
+        offer = _primary_product_offer(company) or _primary_service_offer(company)
+    raw = _offer_price_raw(offer)
+    if raw and offer is not None:
+        return raw, f"{offer.landing_url}, offer", VerificationFlag.UNVERIFIED
+    return _single_field_summary(company.price)
+
+
+def _stock_summary(company: Company, intent_type: IntentType | str | None) -> tuple[str, str | None]:
+    if intent_type == IntentType.PRODUCT or intent_type == IntentType.PRODUCT.value:
+        offer = _primary_product_offer(company)
+        if offer is not None:
+            quote = None
+            for evidence in offer.evidence:
+                if evidence.field == "stock_status":
+                    quote = evidence.source_text
+                    break
+            return offer.stock_status.value, quote
+    return company.stock_status.value, company.stock_status_quote
+
+
+def _columns_for_intent(intent_type: IntentType | str | None) -> list[tuple[str, int]]:
+    if intent_type == IntentType.SERVICE or intent_type == IntentType.SERVICE.value:
+        return _SERVICE_COLUMNS
+    return _COLUMNS
+
+
+def _write_header(ws: Worksheet, header_row: int, columns: list[tuple[str, int]]) -> None:
+    for col_idx, (title, width) in enumerate(columns, start=1):
         cell = ws.cell(row=header_row, column=col_idx, value=title)
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
@@ -157,6 +240,7 @@ def export_companies_to_excel(
     output_path: str | Path,
     required_qty: Quantity | None = None,
     summary: str | None = None,
+    intent_type: IntentType | str | None = None,
 ) -> Path:
     """`required_qty`/`summary` — опциональны (см. pipeline.summarize_availability):
     без них поведение экспорта не меняется (кроме сдвига колонок 15-20 на
@@ -167,16 +251,17 @@ def export_companies_to_excel(
     wb = Workbook()
     ws = wb.active
     ws.title = "Поставщики"
+    columns = _columns_for_intent(intent_type)
 
     header_row = 1
     if summary:
         summary_cell = ws.cell(row=1, column=1, value=summary)
         summary_cell.font = Font(bold=True)
         summary_cell.alignment = Alignment(wrap_text=True, vertical="center")
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(_COLUMNS))
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(columns))
         header_row = 2
 
-    _write_header(ws, header_row)
+    _write_header(ws, header_row, columns)
     ws.freeze_panes = ws.cell(row=header_row + 1, column=1).coordinate
 
     # Порядок берётся как есть, БЕЗ пересортировки по чистому score.total —
@@ -190,7 +275,8 @@ def export_companies_to_excel(
         email_val, email_src, email_flag = _field_summary(company.contacts.get("email", []))
         addr_val, addr_src, addr_flag = _field_summary(company.contacts.get("address", []))
         site_val, site_src, site_flag = _field_summary(company.contacts.get("website", []))
-        price_val, price_src, price_flag = _single_field_summary(company.price)
+        price_val, price_src, price_flag = _price_summary(company, intent_type)
+        stock_val, stock_quote = _stock_summary(company, intent_type)
 
         availability = company.availability
         found_val = _format_quantity(availability.quantity) if availability else ""
@@ -219,8 +305,8 @@ def export_companies_to_excel(
             site_val,
             site_src,
             ", ".join(company.sources),
-            company.stock_status.value,
-            company.stock_status_quote or "",
+            stock_val,
+            stock_quote or "",
             _format_quantity(required_qty),
             found_val,
             pack_val,
@@ -249,7 +335,13 @@ def export_companies_to_excel(
             ws.cell(row=row_idx, column=col_idx).fill = _FLAG_FILL[flag]
 
         # "Наличие товара" — 13-я колонка (см. _COLUMNS): после "Источники (каталоги)".
-        ws.cell(row=row_idx, column=13).fill = _STOCK_FILL[company.stock_status]
+        stock_status = (
+            _primary_product_offer(company).stock_status
+            if (intent_type == IntentType.PRODUCT or intent_type == IntentType.PRODUCT.value)
+            and _primary_product_offer(company) is not None
+            else company.stock_status
+        )
+        ws.cell(row=row_idx, column=13).fill = _STOCK_FILL[stock_status]
 
         if company.availability_verdict is not None:
             ws.cell(row=row_idx, column=_COL_AVAILABILITY_VERDICT).fill = _AVAILABILITY_FILL[

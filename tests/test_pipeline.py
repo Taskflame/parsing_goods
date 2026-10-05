@@ -12,6 +12,9 @@ from procurement_search.models import (
     Candidate,
     Company,
     FieldValue,
+    PageType,
+    ProductMatch,
+    ProductOffer,
     ScoreBreakdown,
     StockStatus,
     VerificationFlag,
@@ -241,6 +244,123 @@ def test_website_liveness_attached_when_candidate_has_website(monkeypatch):
     assert website_field.confidence == VerificationFlag.CONFIRMED
 
 
+def test_product_dedup_group_prefers_exact_product_detail_over_category(monkeypatch):
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="Каталог ноутбуков ThinkPad",
+                description_raw="Все ноутбуки Lenovo ThinkPad",
+                website="https://shop.example/catalog/notebooks/",
+            ),
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/2",
+                name_raw="Lenovo ThinkPad P16v Gen 2",
+                description_raw="Ноутбук Lenovo ThinkPad P16v в наличии",
+                website="https://shop.example/product/thinkpad-p16v-gen-2",
+            ),
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(pipeline, "extract_brand", lambda raw_query, **kwargs: "Lenovo")
+    monkeypatch.setattr(pipeline, "resolve_product_category_links", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+
+    companies = search_and_score(
+        "Lenovo ThinkPad P16v 100 шт",
+        enricher=NullEnricher(),
+        verify_websites=True,
+    )
+
+    assert companies[0].name.value == "Lenovo ThinkPad P16v Gen 2"
+    assert companies[0].raw_candidates[0].website == "https://shop.example/product/thinkpad-p16v-gen-2"
+
+
+def test_product_category_resolver_adds_site_search_product_detail(monkeypatch):
+    queries_seen: list[str] = []
+
+    def fake_candidates(query: str) -> list[Candidate]:
+        queries_seen.append(query)
+        if query.startswith("site:shop.example"):
+            return [
+                Candidate(
+                    source="yandex_search",
+                    source_url="https://x.example/detail",
+                    name_raw="Lenovo ThinkPad P16v Gen 2",
+                    description_raw="Ноутбук Lenovo ThinkPad P16v в наличии",
+                    website="https://shop.example/product/thinkpad-p16v-gen-2",
+                )
+            ]
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/category",
+                name_raw="Каталог ноутбуков ThinkPad",
+                description_raw="Все ноутбуки Lenovo ThinkPad",
+                website="https://shop.example/catalog/notebooks/",
+            )
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(pipeline, "extract_brand", lambda raw_query, **kwargs: "Lenovo")
+    monkeypatch.setattr(pipeline, "resolve_product_category_links", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+
+    companies = search_and_score(
+        "Lenovo ThinkPad P16v 100 шт",
+        enricher=NullEnricher(),
+        verify_websites=True,
+    )
+
+    assert any(q.startswith("site:shop.example") for q in queries_seen)
+    assert companies[0].raw_candidates[0].website == "https://shop.example/product/thinkpad-p16v-gen-2"
+
+
+def test_product_category_resolver_adds_html_product_detail(monkeypatch):
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/category",
+                name_raw="Каталог ноутбуков ThinkPad",
+                description_raw="Все ноутбуки Lenovo ThinkPad",
+                website="https://shop.example/catalog/notebooks/",
+            )
+        ]
+
+    def fake_resolve(category, intent, clean_query_text):
+        return [
+            Candidate(
+                source="yandex_search:category_resolver",
+                source_url=category.website,
+                name_raw="Lenovo ThinkPad P16v Gen 2",
+                description_raw="Ноутбук Lenovo ThinkPad P16v в наличии",
+                website="https://shop.example/product/thinkpad-p16v-gen-2",
+            )
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(pipeline, "extract_brand", lambda raw_query, **kwargs: "Lenovo")
+    monkeypatch.setattr(pipeline, "resolve_product_category_links", fake_resolve)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+
+    companies = search_and_score(
+        "Lenovo ThinkPad P16v 100 шт",
+        enricher=NullEnricher(),
+        verify_websites=True,
+    )
+
+    assert companies[0].raw_candidates[0].website == "https://shop.example/product/thinkpad-p16v-gen-2"
+
+
 def test_website_liveness_skipped_when_disabled(monkeypatch):
     def fake_candidates(query: str) -> list[Candidate]:
         return [
@@ -372,8 +492,9 @@ def test_deep_relevance_llm_check_penalizes_negative_verdict(monkeypatch):
 def test_deep_relevance_attribute_mismatch_penalizes_score(monkeypatch):
     """check_attribute_match — отдельная проверка от classify_relevance:
     товар той же категории продаётся на сайте (is_relevant=True), но
-    конкретная характеристика не совпадает с запрошенной (насос на 18 л/ч
-    вместо 10000 л/час) — relevance всё равно должен просесть."""
+    конкретная характеристика не совпадает с запрошенной, причём отличие
+    сформулировано так, что детерминированный matcher единиц его не ловит —
+    relevance всё равно должен просесть по LLM-сигналу."""
 
     def fake_candidates(query: str) -> list[Candidate]:
         return [
@@ -393,7 +514,7 @@ def test_deep_relevance_attribute_mismatch_penalizes_score(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "crawl_site_text",
-        lambda url, **kwargs: "насос дренажный проточный 18 л/ч",
+        lambda url, **kwargs: "насос дренажный для слабого бытового потока",
     )
     monkeypatch.setattr(pipeline, "classify_relevance", lambda raw_query, site_text: True)
     monkeypatch.setattr(pipeline, "check_attribute_match", lambda raw_query, site_text: False)
@@ -891,6 +1012,29 @@ def test_ranking_key_priced_companies_rank_above_unpriced_regardless_of_score():
     assert companies[1] is unpriced_high_score
 
 
+def test_ranking_key_uses_product_offer_price_when_company_price_missing():
+    cheap_offer = _company_with_price(None)
+    cheap_offer.product_offers.append(
+        ProductOffer(
+            company_id=None,
+            landing_url="https://cheap.example/product",
+            page_type=PageType.PRODUCT_DETAIL,
+            product_match=ProductMatch.COMPATIBLE,
+            price=10000.0,
+            currency="RUB",
+        )
+    )
+    cheap_offer.score = pipeline.ScoreBreakdown(relevance=0.1, trust=0.1, confidence=0.1, total=0.05)
+
+    unpriced_high_score = _company_with_price(None)
+    unpriced_high_score.score = pipeline.ScoreBreakdown(relevance=0.9, trust=0.9, confidence=0.9, total=0.9)
+
+    companies = [unpriced_high_score, cheap_offer]
+    companies.sort(key=lambda c: pipeline._ranking_key(c, marketplace_domains=[]))
+
+    assert companies[0] is cheap_offer
+
+
 def test_deep_relevance_sorts_final_list_by_crawled_price(monkeypatch):
     def fake_candidates(query: str) -> list[Candidate]:
         return [
@@ -927,6 +1071,78 @@ def test_deep_relevance_sorts_final_list_by_crawled_price(monkeypatch):
     # выше Слой-1 relevance (описание точнее совпадает с запросом).
     assert companies[0].name.value == "ООО Дешёвый Насос"
     assert companies[1].name.value == "ООО Дорогой Насос"
+
+
+def test_product_price_is_extracted_from_landing_page_not_merged_site_text(monkeypatch):
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="Генератор бензиновый 2,5 кВт",
+                description_raw="Генератор бензиновый 2,5 кВт в наличии",
+                website="https://shop.example/product/generator-25kw",
+            )
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+
+    def fake_crawl(url, **kwargs):
+        if kwargs.get("max_pages") == 1:
+            return "Генератор бензиновый 2,5 кВт. Цена 50 000 руб."
+        return "Раздел доставки: 100 руб. Контакты магазина. Генераторы в каталоге."
+
+    monkeypatch.setattr(pipeline, "crawl_site_text", fake_crawl)
+
+    companies = search_and_score(
+        "генератор бензиновый 2,5 кВт 6 шт",
+        enricher=NullEnricher(),
+        deep_relevance=True,
+    )
+
+    assert companies[0].price.value == "50 000 руб."
+    assert len(companies[0].product_offers) == 1
+    offer = companies[0].product_offers[0]
+    assert offer.landing_url == "https://shop.example/product/generator-25kw"
+    assert offer.product_match == ProductMatch.COMPATIBLE
+    assert offer.price == 50000.0
+    assert offer.currency == "RUB"
+    assert any(e.field == "price" and e.value == "50 000 руб." for e in offer.evidence)
+
+
+def test_product_attribute_mismatch_does_not_create_offer_or_price(monkeypatch):
+    def fake_candidates(query: str) -> list[Candidate]:
+        return [
+            Candidate(
+                source="yandex_search",
+                source_url="https://x.example/1",
+                name_raw="Генератор бензиновый S2300IS 1,8 кВт",
+                description_raw="Генератор бензиновый 1,8 кВт в наличии",
+                website="https://shop.example/product/s2300is-18kw",
+            )
+        ]
+
+    _patch_sources(monkeypatch, fake_candidates)
+    monkeypatch.setattr(
+        pipeline, "check_website_liveness", lambda url, **kwargs: VerificationFlag.CONFIRMED
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "crawl_site_text",
+        lambda url, **kwargs: "Генератор бензиновый S2300IS 1,8 кВт. Цена 30 000 руб.",
+    )
+
+    companies = search_and_score(
+        "генератор бензиновый 2,5 кВт 6 шт",
+        enricher=NullEnricher(),
+        deep_relevance=True,
+    )
+
+    assert companies[0].price is None
+    assert companies[0].product_offers == []
 
 
 class _SpyEnricher(Enricher):
