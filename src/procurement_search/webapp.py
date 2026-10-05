@@ -20,12 +20,13 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -55,6 +56,25 @@ class SearchRequest(BaseModel):
     use_trusted_suppliers: bool = False
     check_availability: bool = False
     probe_stepper: bool = False
+    # Персональный получатель отчёта. Если задан — готовый Excel-отчёт
+    # отправляется ИМЕННО на эту почту (для сценария тестирования, когда
+    # каждый сотрудник хочет получить результат сразу на свой ящик), иначе —
+    # на EMAIL_TO из окружения.
+    email: str | None = None
+
+
+class FeedbackRequest(BaseModel):
+    """Обратная связь по отчёту (изолированный модуль feedback.py).
+
+    name/email необязательны — отзыв может быть анонимным (см.
+    feedback.save_feedback): если email ввёл — привязываем к отчёту,
+    если нет — сохраняем реакцию без автора.
+    """
+    report_key: str
+    name: str | None = None
+    email: str | None = None
+    rating: str = "up"          # up / down / text
+    comment: str = ""
 
 
 class AddTrustedSupplierRequest(BaseModel):
@@ -117,6 +137,88 @@ def _slugify(text: str, max_len: int = 40) -> str:
 # из истории). Лок сериализует read-modify-write целиком.
 _REPORT_INDEX_LOCK = threading.Lock()
 
+# --- Асинхронный поиск (jobs) ---------------------------------------------
+# Поиск тяжёлый (до нескольких минут), CloudPub рвёт длинные синхронные
+# запросы (502). Поэтому /api/search сразу возвращает 202 c job_id, а поиск
+# идёт в фоновом потоке, результат кладётся в _JOBS[job_id]. Фронтенд
+# опрашивает /api/jobs/{job_id} до статуса done.
+_JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _create_job() -> str:
+    """Создаёт запись job со статусом pending и возвращает job_id."""
+    job_id = uuid.uuid4().hex
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {"job_id": job_id, "status": "pending", "result": None, "error": None}
+    return job_id
+
+
+def _get_job(job_id: str) -> dict | None:
+    with _JOBS_LOCK:
+        return _JOBS.get(job_id)
+
+
+def _set_job_done(job_id: str, result: dict) -> None:
+    with _JOBS_LOCK:
+        _JOBS[job_id]["status"] = "done"
+        _JOBS[job_id]["result"] = result
+        _JOBS[job_id]["error"] = None
+
+
+def _set_job_error(job_id: str, error: str) -> None:
+    with _JOBS_LOCK:
+        _JOBS[job_id]["status"] = "error"
+        _JOBS[job_id]["error"] = error
+        _JOBS[job_id]["result"] = None
+
+
+def _run_search_job(job_id: str, payload_kwargs: dict, email: str | None = None) -> None:
+    """Фоновая задача: запускает поиск с payload_kwargs, формирует отчёт,
+    пишет в историю, отправляет письмо и кладёт результат в _JOBS."""
+    try:
+        query = payload_kwargs["query"].strip()
+        # Только продолжительность поиска (без времени начала/конца) — замер
+        # вокруг search_and_score, в секундах с округлением, чтобы показать
+        # в «Истории отчётов» отдельной колонкой, сколько занял каждый запрос.
+        _start = time.monotonic()
+        result = search_and_score(query, **payload_kwargs["search_kwargs"])
+        duration_seconds = round(time.monotonic() - _start, 1)
+        effective_amount = result.effective_order_amount()
+        summary = summarize_availability(result, effective_amount)
+
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now()
+        filename = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{_slugify(query)}_{uuid.uuid4().hex[:8]}.xlsx"
+        export_companies_to_excel(result, REPORTS_DIR / filename, required_qty=effective_amount, summary=summary)
+
+        entry = {
+            "filename": filename,
+            "query": query,
+            "created_at": timestamp.isoformat(timespec="seconds"),
+            "companies_count": len(result),
+            "duration_seconds": duration_seconds,
+        }
+        _append_report_entry(entry)
+
+        from procurement_search.feedback import try_send_report_email
+        try_send_report_email(REPORTS_DIR / filename, query, to=email)
+
+        required_quantity = (
+            f"{effective_amount.value:g} {effective_amount.unit}" if effective_amount else None
+        )
+        result_payload = {
+            "report": entry,
+            "companies": [_company_to_dict(c) for c in result],
+            "required_quantity": required_quantity,
+            "availability_summary": summary,
+            "query_used": query,
+        }
+        _set_job_done(job_id, result_payload)
+    except Exception as exc:  # noqa: BLE001 — сбой поиска не роняет сервер
+        logger.warning("async job %s failed: %s", job_id, exc, exc_info=True)
+        _set_job_error(job_id, str(exc))
+
 
 def _load_report_index_unlocked() -> list[dict]:
     if not INDEX_PATH.exists():
@@ -143,6 +245,9 @@ def _load_report_index() -> list[dict]:
 
 def _append_report_entry(entry: dict) -> None:
     with _REPORT_INDEX_LOCK:
+        # Гарантированно создаём каталог с индексом отчётов — фоновый поток
+        # (async-поиск) может прийти сюда раньше, чем REPORTS_DIR будет готов.
+        INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
         entries = _load_report_index_unlocked()
         entries.insert(0, entry)
         _save_report_index_unlocked(entries)
@@ -232,54 +337,44 @@ def _company_to_dict(company: Company) -> dict:
     }
 
 
-@app.post("/api/search")
+@app.post("/api/search", status_code=202)
 def api_search(payload: SearchRequest) -> dict:
+    """Асинхронный поиск: сразу возвращает 202 c job_id, чтобы CloudPub не рвал
+    длинный запрос (502). Сам поиск идёт в фоновом потоке (_run_search_job),
+    результат запрашивается фронтендом через /api/jobs/{job_id} (polling)."""
     query = payload.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Пустой запрос")
 
-    result = search_and_score(
-        query,
-        use_llm_fallback=payload.use_llm_fallback,
-        deep_relevance=payload.deep_relevance,
-        relevance_llm_check=payload.relevance_llm_check,
-        use_trusted_suppliers=payload.use_trusted_suppliers,
-        check_availability=payload.check_availability,
-        probe_stepper=payload.probe_stepper,
-    )
-    effective_amount = result.effective_order_amount()
-    summary = summarize_availability(result, effective_amount)
-
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now()
-    # timestamp с точностью до секунды + uuid-суффикс — без него два поиска
-    # с похожим запросом, завершившиеся в одну и ту же секунду (несколько
-    # одновременных пользователей на сервере, см. README §Деплой), получали
-    # бы один и тот же filename и тихо перезатирали отчёт друг друга.
-    filename = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{_slugify(query)}_{uuid.uuid4().hex[:8]}.xlsx"
-    export_companies_to_excel(result, REPORTS_DIR / filename, required_qty=effective_amount, summary=summary)
-
-    entry = {
-        "filename": filename,
-        "query": query,
-        "created_at": timestamp.isoformat(timespec="seconds"),
-        "companies_count": len(result),
+    kwargs = {
+        "use_llm_fallback": payload.use_llm_fallback,
+        "deep_relevance": payload.deep_relevance,
+        "relevance_llm_check": payload.relevance_llm_check,
+        "use_trusted_suppliers": payload.use_trusted_suppliers,
+        "check_availability": payload.check_availability,
+        "probe_stepper": payload.probe_stepper,
     }
-    _append_report_entry(entry)
+    job_id = _create_job()
+    threading.Thread(
+        target=_run_search_job,
+        args=(job_id, {"query": query, "search_kwargs": kwargs}, payload.email),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "status": "pending"}
 
-    # order_qty (штуки/комплекты) и order_length (метраж) — независимые
-    # поля (см. pipeline.SearchResult), оба доступны фронтенду отдельно,
-    # required_quantity — уже выбранная "эффективная" цель для отображения
-    # в общей сводке (см. pipeline.effective_order_amount).
-    required_quantity = (
-        f"{effective_amount.value:g} {effective_amount.unit}" if effective_amount else None
-    )
-    return {
-        "report": entry,
-        "companies": [_company_to_dict(c) for c in result],
-        "required_quantity": required_quantity,
-        "availability_summary": summary,
-    }
+
+@app.get("/api/jobs/{job_id}")
+def api_get_job(job_id: str) -> dict:
+    """Статус/результат асинхронного поиска (polling целевой для фронтенда).
+
+    Отдаёт: {"job_id", "status": pending|done|error, "result": {...} | None, "error"}.
+    Когда status == done, result содержит тот же словарь, что раньше возвращал
+    /api/search (report/companies/required_quantity/availability_summary/query_used).
+    """
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return job
 
 
 @app.get("/api/reports")
@@ -300,6 +395,43 @@ def api_download_report(filename: str) -> FileResponse:
         filename=safe_name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+@app.delete("/api/reports/{filename}")
+def api_delete_report(filename: str) -> dict:
+    """Удаляет запрос/отчёт из истории отчётов (index.json) и сам .xlsx.
+
+    Сделано по просьбе: история не должна разрастаться бесконечно, и байер
+    хочет убирать лишние/тестовые запросы. Удаляем и запись из index.json, и
+    файл отчёта на диске (освобождает место); если файла нет, но запись была —
+    всё равно убираем запись (не оставляем «битую» строку).
+
+    os.path.basename — та же защита от path traversal, что в api_download_report.
+    """
+    safe_name = os.path.basename(filename)
+
+    removed_from_index = False
+    with _REPORT_INDEX_LOCK:
+        entries = _load_report_index_unlocked()
+        new_entries = [e for e in entries if e.get("filename") != safe_name]
+        if len(new_entries) != len(entries):
+            removed_from_index = True
+            _save_report_index_unlocked(new_entries)
+
+    # Файл удаляем независимо от того, была ли запись в индексе (на случай
+    # осиротевших .xlsx). os.remove безвреден, если файла нет.
+    file_removed = False
+    path = REPORTS_DIR / safe_name
+    if path.is_file():
+        try:
+            path.unlink()
+            file_removed = True
+        except OSError:
+            logger.warning("Не удалось удалить файл отчёта %s", safe_name, exc_info=True)
+
+    if not removed_from_index and not file_removed:
+        raise HTTPException(status_code=404, detail="Отчёт не найден")
+    return {"deleted": safe_name, "from_index": removed_from_index, "file_removed": file_removed}
 
 
 @app.get("/api/categories")
@@ -398,6 +530,258 @@ def api_delete_trusted_supplier(domain: str) -> dict:
     if not deleted:
         raise HTTPException(status_code=404, detail="Поставщик с таким доменом не найден в базе")
     return {"deleted": domain}
+
+
+@app.post("/api/photo-search", status_code=202)
+async def api_photo_search(
+    file: UploadFile = File(...),
+    use_llm_fallback: bool = Form(False),
+    deep_relevance: bool = Form(False),
+    relevance_llm_check: bool = Form(False),
+    use_trusted_suppliers: bool = Form(False),
+    check_availability: bool = Form(False),
+    probe_stepper: bool = Form(False),
+    email: str | None = Form(None),
+) -> dict:
+    """Поиск по фото — ИЗОЛИРОВАННЫЙ эндпоинт.
+
+    Принимает загруженный файл-картинку (multipart), определяет товар через
+    мультимодальную модель (qwen3.6-35b-a3b) и запускает тот же search_and_score,
+    что и /api/search (существующий конвейер не меняется). Флаги галочек приходят
+    ТОЛЬКО через Form(...) — без этого FastAPI не берёт их из multipart-тела и
+    они остаются False (тяжёлые слои цена/наличие не запускались).
+
+    Ответ — тот же формат, что у /api/search, плюс служебное поле query_used.
+
+    Это async def, потому что чтение файла из multipart — async-операция
+    (FastAPI разбирает тело запроса в асинхронном контексте).
+    """
+    # Читаем файл целиком в память — картинка никуда не сохраняется на диск.
+    data = await file.read()
+    mimetype = (file.content_type or "").strip() or "image/jpeg"
+
+    # Ленивый импорт модуля поиска по фото — чтобы модуль (и его зависимости)
+    # подгружался только когда реально используется, не влияя на остальные
+    # маршруты и обычный поиск.
+    from procurement_search.photo_search import describe_product_from_image
+
+    # Мультимодальная модель (qwen3.6-35b-a3b) описывает товар по фото, с учётом
+    # форм-фактора (если надписей нет — по внешнему виду), и сразу даёт ядро.
+    query = describe_product_from_image(data, mimetype)
+    if not query.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Не удалось определить товар по изображению. Убедитесь, что это "
+            "чёткое фото товара/детали/этикетки.",
+        )
+
+    # Поиск по фото теперь тоже асинхронный: распознали запрос (быстро),
+    # запускаем тяжёлый поиск в фоновом потоке и сразу возвращаем 202 с job_id
+    # (чтобы CloudPub не рвал длинный запрос, как в /api/search).
+    kwargs = {
+        "use_llm_fallback": use_llm_fallback,
+        "deep_relevance": deep_relevance,
+        "relevance_llm_check": relevance_llm_check,
+        "use_trusted_suppliers": use_trusted_suppliers,
+        "check_availability": check_availability,
+        "probe_stepper": probe_stepper,
+    }
+    job_id = _create_job()
+    threading.Thread(
+        target=_run_search_job,
+        args=(job_id, {"query": query, "search_kwargs": kwargs}, email),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "status": "pending", "query_used": query}
+
+
+def _feedback_submit_url(report_key: str, rating: str, email: str | None) -> str:
+    """Короткая относительная ссылка для оценки на странице /api/feedback/submit.
+
+    (Без внешнего APP_BASE_URL — браузер уже на странице приложения.)
+    """
+    from urllib.parse import urlencode
+    params = {"report_key": report_key, "rating": rating}
+    if email:
+        params["email"] = email
+    return f"/api/feedback/submit?{urlencode(params)}"
+
+
+def _query_for_report(report_key: str) -> str | None:
+    """Достаёт текст запроса из истории отчётов (index.json) по имени файла.
+
+    Нужен, чтобы в отзыве (feedback.db) был виден не только report_key (имя
+    файла), но и сам запрос, по которому сформирован отчёт. Клик по эмодзи
+    в письме приходит без query — подставляем отсюда.
+    """
+    for e in _load_report_index():
+        if e.get("filename") == report_key:
+            return e.get("query")
+    return None
+
+
+@app.post("/api/feedback")
+def api_feedback(payload: FeedbackRequest) -> dict:
+    """Сохраняет отзыв по отчёту (оценка/комментарий) в SQLite feedback.db."""
+    from procurement_search.feedback import save_feedback
+
+    res = save_feedback(
+        report_key=payload.report_key,
+        name=payload.name,
+        email=payload.email,
+        rating=payload.rating,
+        comment=payload.comment,
+        query=_query_for_report(payload.report_key),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=422, detail=res.get("error", "Ошибка сохранения отзыва"))
+    return res
+
+
+@app.get("/api/feedback")
+def api_list_feedback(
+    since: str | None = None,
+    until: str | None = None,
+) -> list[dict]:
+    """Список всех отзывов (для панели просмотра) из SQLite.
+
+    Опционально `since`/`until` (ISO-даты) ограничивают диапазон — тем же
+    путём, что и понедельный отчёт (см. feedback_report.build_feedback_report).
+    """
+    from procurement_search.feedback import get_feedback_list
+    return get_feedback_list(since=since, until=until)
+
+
+@app.get("/api/feedback/report")
+def api_feedback_report(
+    since: str | None = None,
+    until: str | None = None,
+) -> FileResponse:
+    """Скачать Excel по ВСЕМ реакциям/отзывам (лист 'Все отзывы' + 'Сводка по неделям').
+
+    Это то, ради чего заводилась панель отзывов: собрать накопленный фидбек
+    в отдельный файл (см. feedback_report.py). Опционально since/until —
+    выгрузить только за диапазон дат; без них — весь накопленный фидбек.
+    Файл генерируется на лету во временный каталог и отдаётся как xlsx.
+    """
+    import tempfile
+
+    from procurement_search.feedback_report import export_feedback_to_excel
+    from procurement_search.feedback import get_feedback_list
+
+    rows = get_feedback_list(since=since, until=until)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="feedback_report_"))
+    out = export_feedback_to_excel(rows, tmp_dir / "feedback_report.xlsx")
+    return FileResponse(
+        out,
+        filename="feedback_report.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.get("/api/feedback/submit", response_class=HTMLResponse)
+def api_feedback_submit(
+    report_key: str,
+    rating: str,
+    email: str | None = None,
+    name: str | None = None,
+):
+    """Клик по эмодзи в письме — сохраняет оценку и показывает ТОЛЬКО благодарность.
+
+    Приходит GET /api/feedback/submit?report_key=...&rating=up|down&email=<получатель>,
+    куда ведут эмодзи-кнопки из письма. Оценка сразу записывается в SQLite
+    (кто — email, на какой отчёт — report_key). Затем показывается страница
+    только с благодарностью (без формы) — как попросил пользователь.
+    """
+    if rating not in ("up", "down", "text"):
+        raise HTTPException(status_code=422, detail="Неизвестная оценка")
+    if not report_key:
+        raise HTTPException(status_code=422, detail="Не указан отчёт")
+
+    from procurement_search.feedback import save_feedback
+
+    # Сохраняем оценку ВСЕГДА, даже анонимно. Раньше запись шла только при
+    # наличии who (email/name): если в ссылке из письма не было email, клик по
+    # эмодзи показывал благодарность, но оценка терялась без следа в feedback.db.
+    who = email or name
+    save_feedback(
+        report_key=report_key,
+        name=name or who,
+        email=who,
+        rating=rating if rating in ("up", "down") else "text",
+        comment="",
+        query=_query_for_report(report_key),
+    )
+
+    page = f"""<html><head><meta charset="utf-8"></head>
+<body style="font-family:Arial,sans-serif;background:#f6f8f7;margin:0;padding:24px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 auto;max-width:560px">
+    <tr><td>
+      <div style="background:#ffffff;border:1px solid #e3e7e3;border-radius:16px;padding:40px;color:#30332f;text-align:center">
+        <div style="font-size:56px;line-height:1">💚</div>
+        <h1 style="margin:18px 0 10px;font-size:22px">Благодарим за оставленное мнение!</h1>
+        <p style="margin:0;color:#65655f;font-size:15px">На основе него мы будем формировать более комфортные условия для Вашей работы.</p>
+      </div>
+    </td></tr>
+  </table>
+</body></html>"""
+    return HTMLResponse(content=page, media_type="text/html; charset=utf-8")
+
+
+@app.get("/api/feedback/comment", response_class=HTMLResponse)
+def api_feedback_comment(
+    report_key: str,
+    email: str | None = None,
+    name: str | None = None,
+    comment: str | None = None,
+):
+    """Комментарий из письма (кнопка «💬 Оставить комментарий»).
+
+    GET /api/feedback/comment?report_key=...&email=... — показывает форму
+    комментария; при повторном GET с ?comment=... сохраняет его и показывает
+    благодарность.
+    """
+    from procurement_search.feedback import save_feedback
+
+    if not report_key:
+        raise HTTPException(status_code=422, detail="Не указан отчёт")
+
+    if comment and comment.strip():
+        who = email or name or "Пользователь"
+        save_feedback(
+            report_key=report_key,
+            name=name or who,
+            email=who,
+            rating="text",
+            comment=comment.strip(),
+            query=_query_for_report(report_key),
+        )
+        page = f"""<html><head><meta charset="utf-8"></head>
+<body style="font-family:Arial,sans-serif;background:#f6f8f7;margin:0;padding:24px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 auto;max-width:560px">
+    <tr><td><div style="background:#fff;border:1px solid #e3e7e3;border-radius:16px;padding:40px;text-align:center;color:#30332f">
+      <div style="font-size:56px">💚</div>
+      <h1 style="margin:18px 0 10px;font-size:22px">Благодарим за отзыв!</h1>
+      <p style="margin:0;color:#65655f;font-size:15px">Мы учтём ваше замечание и будем улучшаться.</p>
+    </div></td></tr></table>
+</body></html>"""
+    else:
+        page = f"""<html><head><meta charset="utf-8"></head>
+<body style="font-family:Arial,sans-serif;background:#f6f8f7;margin:0;padding:24px;">
+  <div style="background:#fff;border:1px solid #e3e7e3;border-radius:16px;padding:28px;max-width:520px;margin:0 auto;color:#30332f">
+    <h2 style="margin:0 0 6px;font-size:20px">Расскажите подробнее</h2>
+    <p style="margin:0 0 16px;color:#65655f;font-size:14px">Что бы вы хотели улучшить или уточнить по отчёту?</p>
+    <form method="get" action="/api/feedback/comment">
+      <input type="hidden" name="report_key" value="{report_key}">
+      <input type="hidden" name="email" value="{email or ''}">
+      <input type="hidden" name="name" value="{name or ''}">
+      <textarea name="comment" rows="4" placeholder="Ваш комментарий..." style="width:100%;padding:12px;border:1px solid #ccc;border-radius:10px;font-size:14px;font-family:inherit;box-sizing:border-box"></textarea>
+      <br><br>
+      <button type="submit" style="background:#00ac86;color:#fff;border:none;padding:13px 26px;border-radius:10px;font-size:15px;cursor:pointer;width:100%">💬 Отправить отзыв</button>
+    </form>
+  </div>
+</body></html>"""
+    return HTMLResponse(content=page, media_type="text/html; charset=utf-8")
 
 
 # Статика монтируется последней: маршруты /api/* должны иметь приоритет

@@ -26,9 +26,41 @@ def main() -> None:
     load_dotenv(_PROJECT_ROOT / ".env")
 
     parser = argparse.ArgumentParser(description="Поиск поставщиков по текстовому запросу")
-    parser.add_argument("--query", required=True, help="Запрос байера, напр. 'гальванические покрытия'")
+    parser.add_argument(
+        "--query",
+        default=None,
+        help="Запрос байера, напр. 'гальванические покрытия' (не требуется при --feedback-report)",
+    )
     parser.add_argument("--output", default="suppliers.xlsx", help="Путь к выходному Excel-файлу")
     parser.add_argument("--verbose", action="store_true", help="Подробные логи")
+    parser.add_argument(
+        "--feedback-report",
+        action="store_true",
+        help=(
+            "Режим отчёта по отзывам: собрать ВСЕ реакции/отзывы из feedback.db "
+            "в Excel (лист 'Все отзывы' + 'Сводка по неделям'). Не требует --query. "
+            "Опции --since/--until ограничивают диапазон дат (ISO)."
+        ),
+    )
+    parser.add_argument(
+        "--send-feedback-report",
+        action="store_true",
+        help=(
+            "Собрать понедельничный отчёт по отзывам за ПРОШЛУЮ неделю и отправить "
+            "на почту через рассылочную учётку проекта (EMAIL_FROM в .env; получатель — "
+            "EMAIL_TO или aleksandr.smurov@systeme.ru). Не требует --query."
+        ),
+    )
+    parser.add_argument(
+        "--since",
+        default=None,
+        help="Для --feedback-report: включать отзывы с этой ISO-даты (например 2026-09-21)",
+    )
+    parser.add_argument(
+        "--until",
+        default=None,
+        help="Для --feedback-report: включать отзывы по эту ISO-дату включительно",
+    )
     parser.add_argument(
         "--deep-relevance",
         action="store_true",
@@ -81,6 +113,37 @@ def main() -> None:
     # известных ошибок, без LLM (см. log_explainer.py). Всегда включён —
     # бесплатный, ничего не ломает, ничего не отправляет по сети.
     logging.getLogger().addHandler(ExplainingLogHandler())
+
+    if args.send_feedback_report:
+        from procurement_search.feedback_report import send_weekly_feedback_report
+
+        if args.query:
+            parser.error("--query не используется вместе с --send-feedback-report")
+        sent = send_weekly_feedback_report()
+        if sent:
+            print("Понедельничный отчёт по отзывам отправлен на почту.")
+        else:
+            print(
+                "Отчёт по отзывам НЕ отправлен: почта не настроена (EMAIL_FROM/PASSWORD) "
+                "или сбой отправки. Подробности — в логах."
+            )
+        return
+
+    if args.feedback_report:
+        from procurement_search.feedback_report import build_feedback_report
+
+        if args.query:
+            parser.error("--query не используется вместе с --feedback-report")
+        output = build_feedback_report(
+            args.output,
+            since=args.since,
+            until=args.until,
+        )
+        print(f"Отчёт по отзывам сохранён: {output}")
+        return
+
+    if not args.query:
+        parser.error("--query обязателен (или используйте --feedback-report)")
 
     output = run_pipeline(
         args.query,

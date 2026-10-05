@@ -5,6 +5,7 @@ response.choices[0].message.content."""
 import pytest
 
 from procurement_search.yandexgpt_classifier import (
+    _ask_image,
     classify_attribute_match_with_yandexgpt,
     classify_attributes_batch_with_yandexgpt,
     classify_category_with_yandexgpt,
@@ -397,3 +398,35 @@ def test_extract_contacts_with_yandexgpt_parses_partial_result():
     assert result.address == "г. Москва, Кутузовский проспект, 45"
     response_format = client.chat.completions.calls[0]["response_format"]
     assert response_format["json_schema"]["name"] == "ContactGuess"
+
+
+def test_ask_image_sends_base64_image_url_and_parses_photogues():
+    """Мультимодальный путь: картинка передаётся как image_url с data-URI
+    base64, текстовый промпт идёт рядом, ответ парсится в PhotoQueryGuess."""
+    from procurement_search.photo_search import PhotoQueryGuess
+
+    client = _FakeClient('{"keywords": "Кабель ВВГ 3х2,5", "used_text": "ВВГ 3х2,5 ГОСТ", "reasoning": "по этикетке"}')
+
+    result = _ask_image(
+        system_prompt="Ты описываешь товар по фото",
+        prompt_text="Опиши товар",
+        image_bytes=b"jpegbytes",
+        mimetype="image/jpeg",
+        output_model=PhotoQueryGuess,
+        client=client,
+        model="qwen3.6-35b",
+    )
+
+    assert result.keywords == "Кабель ВВГ 3х2,5"
+
+    call = client.chat.completions.calls[0]
+    # user-сообщение — массив из текста и картинки
+    content = call["messages"][1]["content"]
+    assert isinstance(content, list) and len(content) == 2
+    assert content[0]["type"] == "text"
+    assert content[1]["type"] == "image_url"
+    # data-URI тот самый base64 картинки (не в открытом виде)
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert "anBlZ2J5dGVz" in content[1]["image_url"]["url"]  # base64("jpegbytes")
+    # имя модели пришло в вызов
+    assert call["model"] == "qwen3.6-35b"

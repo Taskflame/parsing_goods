@@ -2,7 +2,7 @@
 
 from fastapi.testclient import TestClient
 
-from procurement_search import pipeline, webapp
+from procurement_search import photo_search, pipeline, webapp
 from procurement_search.models import Candidate, VerificationFlag
 from procurement_search.trusted_suppliers import TrustedSupplierStore
 
@@ -46,13 +46,36 @@ def _client(monkeypatch, tmp_path) -> TestClient:
     return TestClient(webapp.app)
 
 
+def _wait_job(client, resp) -> dict:
+    """After POST returns 202 {job_id}, poll /api/jobs/{id} until done,
+    then return job['result']."""
+    import time
+    assert resp.status_code == 202, resp.status_code
+    job_id = resp.json()["job_id"]
+    for _ in range(100):
+        j = client.get(f"/api/jobs/{job_id}").json()
+        if j["status"] == "done":
+            return j["result"]
+        if j["status"] == "error":
+            raise AssertionError(f"job error: {j.get('error')}")
+        time.sleep(0.05)
+    raise AssertionError("job did not finish")
+
+
+def _search_and_wait(client, payload: dict) -> dict:
+    return _wait_job(client, client.post("/api/search", json=payload))
+
+
+def _photo_and_wait(client, **post_kwargs) -> dict:
+    """POST /api/photo-search (multipart), затем ждём done и возвращаем result."""
+    return _wait_job(client, client.post("/api/photo-search", **post_kwargs))
+
+
 def test_search_returns_companies_and_creates_report(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
 
-    resp = client.post("/api/search", json={"query": "гальванические покрытия"})
+    data = _search_and_wait(client, {"query": "гальванические покрытия"})
 
-    assert resp.status_code == 200
-    data = resp.json()
     assert len(data["companies"]) == 1
     assert data["companies"][0]["name"] == "ООО Гальванические покрытия"
     assert data["companies"][0]["phone"]["value"] == "+7 900 111 11 11"
@@ -60,6 +83,15 @@ def test_search_returns_companies_and_creates_report(monkeypatch, tmp_path):
     assert data["companies"][0]["stock_status"] == "не проверено"
     assert data["report"]["query"] == "гальванические покрытия"
     assert (tmp_path / "reports" / data["report"]["filename"]).exists()
+
+    # Продолжительность поиска сохраняется в запись истории (только длительность,
+    # без времён начала/конца) и видна в /api/reports.
+    assert isinstance(data["report"].get("duration_seconds"), (int, float))
+    reports = client.get("/api/reports").json()
+    # Фейковый источник отвечает мгновенно, поэтому duration может быть 0 — важно
+    # лишь, что поле присутствует и неотрицательно (технически >0 в реале, но тут
+    # fake-source не тратит времени).
+    assert any(isinstance(r.get("duration_seconds"), (int, float)) and r["duration_seconds"] >= 0 for r in reports)
 
 
 def test_empty_query_returns_400(monkeypatch, tmp_path):
@@ -73,8 +105,8 @@ def test_empty_query_returns_400(monkeypatch, tmp_path):
 def test_reports_list_and_download_roundtrip(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
 
-    search_resp = client.post("/api/search", json={"query": "гальванические покрытия"})
-    filename = search_resp.json()["report"]["filename"]
+    data = _search_and_wait(client, {"query": "гальванические покрытия"})
+    filename = data["report"]["filename"]
 
     list_resp = client.get("/api/reports")
     assert list_resp.status_code == 200
@@ -93,6 +125,33 @@ def test_download_rejects_path_traversal(monkeypatch, tmp_path):
     assert resp.status_code == 404
 
 
+def test_delete_report_removes_from_index_and_disk(monkeypatch, tmp_path):
+    """DELETE /api/reports/{filename} убирает запись из истории и удаляет .xlsx."""
+    client = _client(monkeypatch, tmp_path)
+
+    data = _search_and_wait(client, {"query": "гальванические покрытия"})
+    filename = data["report"]["filename"]
+    file_path = tmp_path / "reports" / filename
+    assert file_path.exists()
+
+    resp = client.delete(f"/api/reports/{filename}")
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == filename
+
+    # Запись исчезла из списка.
+    list_resp = client.get("/api/reports").json()
+    assert not any(r["filename"] == filename for r in list_resp)
+    # Файл удалён с диска.
+    assert not file_path.exists()
+
+
+def test_delete_report_missing_returns_404(monkeypatch, tmp_path):
+    """Удаление несуществующего отчёта — 404."""
+    client = _client(monkeypatch, tmp_path)
+    resp = client.delete("/api/reports/never_existed.xlsx")
+    assert resp.status_code == 404
+
+
 def test_search_reports_required_quantity_and_availability_summary(monkeypatch, tmp_path):
     """check_availability=False (по умолчанию) — required_quantity/
     availability_summary всё равно вычисляются из Слоя 0.6 (order_qty
@@ -100,10 +159,8 @@ def test_search_reports_required_quantity_and_availability_summary(monkeypatch, 
     None, потому что ни у одной компании ещё нет company.availability."""
     client = _client(monkeypatch, tmp_path)
 
-    resp = client.post("/api/search", json={"query": "цинкование 11 шт"})
+    data = _search_and_wait(client, {"query": "цинкование 11 шт"})
 
-    assert resp.status_code == 200
-    data = resp.json()
     assert data["required_quantity"] == "11 шт"
     assert data["availability_summary"] is None
     assert data["companies"][0]["availability"] is None
@@ -129,10 +186,8 @@ def test_search_includes_website_liveness_field(monkeypatch, tmp_path):
     )
 
     client = TestClient(webapp.app)
-    resp = client.post("/api/search", json={"query": "гальванические покрытия"})
-
-    assert resp.status_code == 200
-    website = resp.json()["companies"][0]["website"]
+    data = _search_and_wait(client, {"query": "гальванические покрытия"})
+    website = data["companies"][0]["website"]
     assert website["value"] == "https://galvanika.ru"
     assert website["confidence"] == "подтверждён"
 
@@ -275,3 +330,294 @@ def test_add_trusted_supplier_rejects_empty_domain_or_name(monkeypatch, tmp_path
     )
 
     assert resp.status_code == 400
+
+
+# --- /api/photo-search — поиск по фото (изолированный модуль) ---
+
+
+def _fake_photo_desc(monkeypatch, query: str):
+    """Подменяет describe_product_from_image, чтобы эндпоинт работал без
+    реальной сети (мультимодальная модель). Возвращает итоговый query."""
+    monkeypatch.setattr(photo_search, "describe_product_from_image", lambda img, mime: query)
+    return query
+
+
+def test_photo_search_runs_separate_endpoint_and_returns_query(monkeypatch, tmp_path):
+    """OCR-запрос по фото (query) уходит в search_and_score, результат отдаёт
+    query_used. Файл отправляется через multipart, поиск асинхронный."""
+    client = _client(monkeypatch, tmp_path)
+    _fake_photo_desc(monkeypatch, "Кабель ВВГ 3х2,5 ГОСТ")
+
+    data = _photo_and_wait(
+        client,
+        files={"file": ("photo.jpg", b"fake-jpeg-bytes", "image/jpeg")},
+    )
+
+    assert data["query_used"] == "Кабель ВВГ 3х2,5 ГОСТ"
+    assert data["report"]["query"] == "Кабель ВВГ 3х2,5 ГОСТ"
+    assert len(data["companies"]) == 1
+    assert data["companies"][0]["name"] == "ООО Гальванические покрытия"
+    assert (tmp_path / "reports" / data["report"]["filename"]).exists()
+
+
+def test_photo_search_fills_search_query(monkeypatch, tmp_path):
+    """OCR/ключевые слова вернули запрос — поиск идёт по нему."""
+    client = _client(monkeypatch, tmp_path)
+    _fake_photo_desc(monkeypatch, "Насос дренажный")
+
+    data = _photo_and_wait(
+        client,
+        files={"file": ("n.jpg", b"fake", "image/jpeg")},
+    )
+
+    assert data["query_used"] == "Насос дренажный"
+    assert data["report"]["query"] == "Насос дренажный"
+
+
+def test_photo_search_empty_ocr_returns_422(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    _fake_photo_desc(monkeypatch, "  ")
+
+    resp = client.post(
+        "/api/photo-search",
+        files={"file": ("blank.jpg", b"", "image/jpeg")},
+    )
+
+    assert resp.status_code == 422
+
+
+def test_photo_search_passes_flags_from_multipart_to_search(monkeypatch, tmp_path):
+    """Галочки, пришедшие как multipart-form (deep_relevance/check_availability),
+    должны дойти до search_and_score. Раньше без Form(...) флаги терялись (False)."""
+    captured = {}
+
+    def _fake_search(query, **kwargs):
+        captured["query"] = query
+        captured["kwargs"] = kwargs
+        return pipeline.search_and_score(query, **kwargs)
+
+    monkeypatch.setattr(webapp, "search_and_score", _fake_search)
+    client = _client(monkeypatch, tmp_path)
+    _fake_photo_desc(monkeypatch, "Мастика ТехноНИКОЛЬ №20")
+
+    _photo_and_wait(
+        client,
+        files={"file": ("p.jpg", b"fake", "image/jpeg")},
+        data={"deep_relevance": "true", "check_availability": "true"},
+    )
+
+    assert captured["kwargs"]["deep_relevance"] is True
+    assert captured["kwargs"]["check_availability"] is True
+
+
+def test_photo_search_sends_report_email(monkeypatch, tmp_path):
+    """/api/photo-search тоже должен автоматически рассылать сформированный
+    Excel-отчёт на EMAIL_TO (тот же механизм, что в /api/search)."""
+    from procurement_search import feedback as feedback_mod
+
+    sent = {}
+
+    def _fake_send(path, query, to=None):
+        sent["path"] = path
+        sent["query"] = query
+        sent["to"] = to
+        return True
+
+    # webapp импортирует try_send_report_email внутри функции
+    # (from ... import), поэтому патчим именно модуль feedback.
+    monkeypatch.setattr(feedback_mod, "try_send_report_email", _fake_send)
+    client = _client(monkeypatch, tmp_path)
+    _fake_photo_desc(monkeypatch, "Насос дренажный")
+
+    _photo_and_wait(client, files={"file": ("n.jpg", b"fake", "image/jpeg")})
+
+    assert sent.get("query") == "Насос дренажный"
+    assert sent.get("path") and str(sent["path"]).endswith(".xlsx")
+    # Без персонального email в форме — рассылка на EMAIL_TO (to=None).
+    assert sent.get("to") in (None, "")
+
+
+# --- Обратная связь по отчётам (feedback.py, SQLite feedback.db) ---
+
+def _patch_feedback_db(monkeypatch, tmp_path):
+    """Направляем SQLite-хранилище отзывов во временный файл, не трогая реальный."""
+    from procurement_search import feedback as feedback_mod
+    monkeypatch.setattr(feedback_mod, "DEFAULT_FEEDBACK_DB", tmp_path / "feedback.db")
+    return feedback_mod
+
+
+def test_feedback_save_and_list(monkeypatch, tmp_path):
+    """Отзыв сохраняется в SQLite и появляется в списке /api/feedback."""
+    _patch_feedback_db(monkeypatch, tmp_path)
+    client = _client(monkeypatch, tmp_path)
+    report_key = "20260101_x.xlsx"
+
+    post = client.post("/api/feedback", json={
+        "report_key": report_key,
+        "name": "Иван",
+        "email": "ivan@example.ru",
+        "rating": "up",
+        "comment": "Помогло!",
+    })
+    assert post.status_code == 200
+    assert post.json()["ok"] is True
+
+    rows = client.get("/api/feedback").json()
+    assert any(r["report_key"] == report_key and r["rating"] == "up"
+               and r["comment"] == "Помогло!" and r["email"] == "ivan@example.ru"
+               for r in rows)
+
+
+def test_feedback_text_comment_keeps_email_and_query(monkeypatch, tmp_path):
+    """Текстовый отзыв (rating='text') сохраняет email и запрос."""
+    _patch_feedback_db(monkeypatch, tmp_path)
+    client = _client(monkeypatch, tmp_path)
+
+    client.post("/api/feedback", json={
+        "report_key": "r1.xlsx", "name": "Анна",
+        "email": "anna@example.ru", "rating": "text",
+        "comment": "Хочу, чтобы добавили колонку с ценой",
+    })
+
+    rows = client.get("/api/feedback").json()
+    mine = [r for r in rows if r["email"] == "anna@example.ru"]
+    assert len(mine) >= 1
+    assert mine[0]["rating"] == "text"
+    assert mine[0]["comment"] == "Хочу, чтобы добавили колонку с ценой"
+
+
+def test_feedback_anonymous_reaction_without_name_email(monkeypatch, tmp_path):
+    """Отзыв можно оставить без имени/email — сохраняется анонимно (None)."""
+    _patch_feedback_db(monkeypatch, tmp_path)
+    client = _client(monkeypatch, tmp_path)
+
+    resp = client.post("/api/feedback", json={
+        "report_key": "anon.xlsx",
+        "name": "",
+        "email": "",
+        "rating": "down",
+        "comment": "",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    rows = client.get("/api/feedback").json()
+    mine = [r for r in rows if r["report_key"] == "anon.xlsx"]
+    assert len(mine) == 1
+    assert mine[0]["rating"] == "down"
+    assert mine[0]["name"] is None
+    assert mine[0]["email"] is None
+
+
+def test_feedback_with_email_but_no_name_saves(monkeypatch, tmp_path):
+    """Можно указать только email (без имени) — отзыв привязывается к email."""
+    _patch_feedback_db(monkeypatch, tmp_path)
+    client = _client(monkeypatch, tmp_path)
+
+    resp = client.post("/api/feedback", json={
+        "report_key": "onlymail.xlsx",
+        "name": "",
+        "email": "buyer@example.ru",
+        "rating": "up",
+        "comment": "",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    rows = client.get("/api/feedback").json()
+    mine = [r for r in rows if r["report_key"] == "onlymail.xlsx"]
+    assert len(mine) == 1
+    assert mine[0]["email"] == "buyer@example.ru"
+
+
+def test_feedback_rejects_invalid_email(monkeypatch, tmp_path):
+    """Если email введён, но некорректен — отклоняем (не сохраняем)."""
+    _patch_feedback_db(monkeypatch, tmp_path)
+    client = _client(monkeypatch, tmp_path)
+
+    resp = client.post("/api/feedback", json={
+        "report_key": "bad.xlsx",
+        "name": "Иван",
+        "email": "не-почта",
+        "rating": "up",
+        "comment": "",
+    })
+    assert resp.status_code == 422
+    rows = client.get("/api/feedback").json()
+    assert not any(r["report_key"] == "bad.xlsx" for r in rows)
+
+
+def test_feedback_submit_from_email_saves_to_db(monkeypatch, tmp_path):
+    """/api/feedback/submit — клик по эмодзи в письме сохраняет оценку в БД
+    с email получателя (чтобы знать, кто оценил) и возвращает HTML-страницу."""
+    _patch_feedback_db(monkeypatch, tmp_path)
+    client = _client(monkeypatch, tmp_path)
+
+    resp = client.get("/api/feedback/submit?report_key=r2.xlsx&rating=up&email=buyer@example.ru")
+    assert resp.status_code == 200
+    # Ответ — HTML-страница (не JSON), чтобы браузер показал форму комментария.
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "Благодарим" in resp.text
+
+    rows = client.get("/api/feedback").json()
+    mine = [r for r in rows if r["email"] == "buyer@example.ru"]
+    assert len(mine) >= 1
+    assert mine[0]["rating"] == "up"
+    assert mine[0]["report_key"] == "r2.xlsx"
+
+
+def test_feedback_submit_link_validates_rating(monkeypatch, tmp_path):
+    """/api/feedback/submit — оценка прямо из письма, невалидный рейтинг — 422."""
+    _patch_feedback_db(monkeypatch, tmp_path)
+    client = _client(monkeypatch, tmp_path)
+    resp = client.get("/api/feedback/submit?report_key=some.xlsx&rating=meh")
+    assert resp.status_code == 422
+
+
+def test_feedback_comment_from_email_saves(monkeypatch, tmp_path):
+    """/api/feedback/comment — кнопка комментария в письме: показывает форму,
+    а с ?comment=... сохраняет текст (rating='text') в БД."""
+    _patch_feedback_db(monkeypatch, tmp_path)
+    client = _client(monkeypatch, tmp_path)
+
+    # 1) форма комментария
+    form = client.get("/api/feedback/comment?report_key=r9.xlsx&email=c@d.ru")
+    assert form.status_code == 200
+    assert form.headers["content-type"].startswith("text/html")
+    assert "textarea" in form.text
+
+    # 2) отправка комментария
+    resp = client.get("/api/feedback/comment",
+                      params={"report_key": "r9.xlsx", "email": "c@d.ru", "comment": "Сделайте колонку с ценой"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "Благодарим" in resp.text
+
+    rows = client.get("/api/feedback").json()
+    mine = [r for r in rows if r["email"] == "c@d.ru"]
+    assert len(mine) >= 1
+    assert mine[0]["rating"] == "text"
+    assert mine[0]["comment"] == "Сделайте колонку с ценой"
+    assert mine[0]["report_key"] == "r9.xlsx"
+
+
+def test_search_forwards_personal_email_to_mailer(monkeypatch, tmp_path):
+    """Если пользователь указал в запросе свой email (персональная рассылка
+    при тестировании), /api/search должен передать его в try_send_report_email."""
+    from procurement_search import feedback as feedback_mod
+
+    sent = {}
+
+    def _fake_send(path, query, to=None):
+        sent["to"] = to
+        return True
+
+    monkeypatch.setattr(feedback_mod, "try_send_report_email", _fake_send)
+    client = _client(monkeypatch, tmp_path)
+
+    _search_and_wait(client, {
+        "query": "гальванические покрытия",
+        "email": "tester@example.ru",
+    })
+
+    assert sent.get("to") == "tester@example.ru"

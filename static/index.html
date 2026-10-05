@@ -218,9 +218,16 @@
     <h2>Новый поиск</h2>
     <form class="search-form" id="search-form">
       <input type="text" id="query" placeholder="Например: гальванические покрытия" required>
+      <input type="email" id="report-email" placeholder="Ваш email для отчёта (на него придёт Excel)" title="Если указать — готовый отчёт придёт на эту почту">
+      <!-- Поиск по фото (изолированный модуль): загрузка картинки -> распознавание
+           текста (Yandex Vision OCR) -> поиск по распознанному запросу через
+           /api/photo-search. Отдельная кнопка, на обычный поиск не влияет. -->
+      <input type="file" id="photo-input" accept="image/*" style="display:none">
+      <button type="button" class="secondary" id="photo-btn" title="Распознать текст с фото (этикетка/накладная) и искать по нему">📷 Фото</button>
       <button type="button" class="secondary" id="advanced-toggle">Доп настройки ▾</button>
       <button type="submit" id="submit-btn">Найти</button>
     </form>
+    <div id="photo-status" class="muted" style="font-size:0.85rem; margin-top:8px;"></div>
     <div id="advanced-options" class="advanced" style="display:none">
       <label><input type="checkbox" id="use-llm" checked> LLM-fallback: опечатки в единицах измерения, бренд в поиске (нужен YANDEX_FM_API_KEY)</label>
       <label><input type="checkbox" id="deep-relevance" checked> Слой 2: краулить сайты кандидатов, находить цену и сортировать по ней (медленнее, точнее)</label>
@@ -261,7 +268,9 @@
   </section>
 
   <section class="panel">
-    <h2>История отчётов</h2>
+    <h2>История отчётов
+      <button type="button" class="secondary" id="feedback-btn" style="margin-left:12px">💬 Отзывы</button>
+    </h2>
     <div class="table-wrap">
       <table id="reports-table">
         <thead>
@@ -269,13 +278,42 @@
             <th>Запрос</th>
             <th>Дата</th>
             <th>Компаний</th>
+            <th>Время</th>
             <th>Файл</th>
+            <th>Оценка</th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
     <div class="empty" id="reports-empty" style="display:none">Пока нет ни одного отчёта.</div>
+    <div id="feedback-panel" style="display:none; margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+      <h3>Отзывы сотрудников</h3>
+      <table id="feedback-table" style="width:100%; border-collapse:collapse">
+        <thead><tr>
+          <th style="text-align:left">Запрос</th><th style="text-align:left">Кто</th>
+          <th style="text-align:left">Email</th><th style="text-align:left">Оценка</th>
+          <th style="text-align:left">Комментарий</th><th style="text-align:left">Дата</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="feedback-empty" style="display:none">Пока отзывов нет.</div>
+    </div>
+    <div id="feedback-form" style="display:none; margin-top:14px; border-top:1px solid var(--border); padding-top:12px; background:var(--bg); border-radius:8px; padding:14px;">
+      <strong>Оцените отчёт <span id="ff-query" class="muted"></span></strong>
+      <div style="display:flex; flex-wrap:wrap; gap:10px; margin-top:8px; align-items:center">
+        <input type="text" id="ff-name" placeholder="Ваше имя (необязательно)" style="flex:1; min-width:140px; padding:8px 10px; border:1px solid var(--border); border-radius:8px">
+        <input type="email" id="ff-email" placeholder="Ваш email (необязательно)" style="flex:1; min-width:180px; padding:8px 10px; border:1px solid var(--border); border-radius:8px">
+      </div>
+      <textarea id="ff-comment" rows="3" placeholder="Напишите ваш отзыв / комментарий по отчёту (можно просто оставить оценку 👍/👎)" style="width:100%; margin-top:10px; padding:10px; border:1px solid var(--border); border-radius:8px; font-size:0.9rem; font-family:inherit; resize:vertical"></textarea>
+      <div style="margin-top:12px; display:flex; flex-wrap:wrap; gap:10px; align-items:center">
+        <button type="button" class="secondary" id="ff-up" title="Оценка: понравилось">👍 Понравилось</button>
+        <button type="button" class="secondary" id="ff-down" title="Оценка: не понравилось">👎 Не понравилось</button>
+        <button type="button" class="secondary" id="ff-text" title="Сохранить только текстовый комментарий">💬 Написать отзыв</button>
+        <span id="ff-key" style="display:none"></span>
+        <span id="ff-status" class="muted" style="margin-left:4px"></span>
+      </div>
+    </div>
   </section>
 
   <section class="panel">
@@ -425,15 +463,55 @@ async function loadReports() {
   reportsEmpty.style.display = reports.length ? 'none' : '';
   for (const r of reports) {
     const tr = document.createElement('tr');
+    // Продолжительность поиска в секундах (только длительность, без времён
+    // начала/конца) — добавляется в запись истории _run_search_job как
+    // duration_seconds. Форматируем в "мин сек" для читаемости, при 0/None — "—".
+    let durText = '—';
+    if (typeof r.duration_seconds === 'number' && r.duration_seconds > 0) {
+      const total = Math.round(r.duration_seconds);
+      const mm = Math.floor(total / 60), ss = total % 60;
+      durText = mm > 0 ? `${mm} мин ${ss.toString().padStart(2,'0')} сек` : `${ss} сек`;
+    }
     tr.innerHTML = `
       <td>${r.query}</td>
       <td class="muted">${new Date(r.created_at).toLocaleString('ru-RU')}</td>
       <td>${r.companies_count}</td>
+      <td class="muted">${durText}</td>
       <td><a class="download" href="/api/reports/${encodeURIComponent(r.filename)}">Скачать .xlsx</a></td>
+      <td style="white-space:nowrap">
+        <!-- Кликабельные эмодзи: клик СРАЗУ сохраняет оценку (как ссылки из
+             письма). Раньше они лишь открывали форму, и оценка терялась если
+             не нажать отдельно — теперь запись в feedback.db идёт мгновенно. -->
+        <a href="#" onclick="rateReport(decodeURIComponent('${encodeURIComponent(r.filename)}'),'up',event);return false;" title="Поставить «понравилось»"
+           style="display:inline-block;text-decoration:none;font-size:22px;padding:4px 10px;border:1px solid #cde9dd;border-radius:8px;background:#f0fdf8;cursor:pointer">👍</a>
+        <a href="#" onclick="rateReport(decodeURIComponent('${encodeURIComponent(r.filename)}'),'down',event);return false;" title="Поставить «не понравилось»"
+           style="display:inline-block;text-decoration:none;font-size:22px;margin-left:6px;padding:4px 10px;border:1px solid #f0d3d3;border-radius:8px;background:#fff4f4;cursor:pointer">👎</a>
+        <a href="#" onclick="deleteReport('${encodeURIComponent(r.filename)}');return false;" title="Удалить из истории"
+           style="display:inline-block;text-decoration:none;font-size:18px;margin-left:10px;padding:5px 10px;border:1px solid #e3e7e3;border-radius:8px;background:#f4f6f5;cursor:pointer">🗑</a>
+      </td>
     `;
     reportsBody.appendChild(tr);
   }
 }
+
+// Удалить запрос/отчёт из истории. Подтверждаем у пользователя (необратимо:
+// исчезает и запись из index.json, и сам .xlsx), затем DELETE на бэкенд и
+// обновляем таблицу. Используется кнопкой 🗑 в строке истории.
+async function deleteReport(reportKey) {
+  const query = decodeURIComponent(reportKey);
+  if (!window.confirm('Удалить этот отчёт из истории? Это действие необратимо.')) return;
+  try {
+    const resp = await fetch('/api/reports/' + encodeURIComponent(query), { method: 'DELETE' });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || ('Ошибка ' + resp.status));
+    }
+    await loadReports();
+  } catch (err) {
+    window.alert('Не удалось удалить: ' + err.message);
+  }
+}
+
 
 function trustedSupplierRowHtml(s) {
   return `
@@ -587,6 +665,90 @@ addTrustedForm.addEventListener('submit', async (e) => {
   }
 });
 
+// --- Поиск по фото (изолированный модуль) ---
+// Кнопка "📷 Фото" открывает выбор файла; после выбора — распознавание текста
+// (Yandex Vision OCR) + поиск через /api/photo-search. На обычный поиск (submit)
+// никак не влияет.
+const photoBtn = document.getElementById('photo-btn');
+const photoInput = document.getElementById('photo-input');
+const photoStatusEl = document.getElementById('photo-status');
+
+photoBtn.addEventListener('click', () => photoInput.click());
+
+photoInput.addEventListener('change', async () => {
+  if (!photoInput.files || !photoInput.files[0]) return;
+  const file = photoInput.files[0];
+  photoStatusEl.className = '';
+  photoStatusEl.textContent = 'Идёт распознавание текста с фото (Yandex Vision)…';
+  resultsPanel.style.display = 'none';
+
+  const formData = new FormData();
+  formData.append('file', file);
+  // Персональный email для отчёта (на него придёт готовый Excel).
+  formData.append('email', document.getElementById('report-email').value.trim());
+  // Добавляем текущие галочки расширенных настроек, как в обычном поиске.
+  formData.append('use_llm_fallback', document.getElementById('use-llm').checked);
+  formData.append('deep_relevance', document.getElementById('deep-relevance').checked);
+  formData.append('relevance_llm_check', document.getElementById('relevance-llm-check').checked);
+  formData.append('use_trusted_suppliers', document.getElementById('use-trusted-suppliers').checked);
+  formData.append('check_availability', document.getElementById('check-availability').checked);
+  formData.append('probe_stepper', document.getElementById('probe-stepper').checked);
+
+  try {
+    const resp = await fetch('/api/photo-search', { method: 'POST', body: formData });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `Ошибка ${resp.status}`);
+    }
+    const data = await resp.json(); // { job_id, status: pending, query_used }
+    const queryUsed = data.query_used || '';
+    statusEl.className = '';
+    statusEl.textContent = 'Товар распознан, запускаем поиск — результат появится автоматически…';
+    // Показываем распознанный с фото текст, чтобы пользователь понял,
+    // по чему реально шёл поиск.
+    photoStatusEl.textContent = `Товар по фото определён → запрос: «${queryUsed}»`;
+    const result = await pollJob(data.job_id, statusEl);
+    renderSearchResult(result);
+    await loadReports();
+    await loadTrustedSuppliers();
+  } catch (err) {
+    photoStatusEl.className = 'error';
+    photoStatusEl.textContent = 'Ошибка: ' + err.message;
+  } finally {
+    photoInput.value = ''; // сброс, чтобы можно было выбрать тот же файл снова
+  }
+});
+
+// --- Асинхронный поиск (polling) ---
+// /api/search возвращает 202 с job_id (CloudPub рвёт длинные синхронные
+// запросы). Здесь опрашиваем /api/jobs/{job_id} до status == done и рендерим.
+function renderSearchResult(data) {
+  statusEl.textContent = `Готово: найдено ${data.companies.length} компаний.`;
+  resultsMeta.textContent = `— «${data.report ? data.report.query : (data.query_used || '')}»`;
+  const summaryEl = document.getElementById('availability-summary');
+  if (data.availability_summary) {
+    summaryEl.textContent = data.availability_summary;
+    summaryEl.style.display = '';
+  } else {
+    summaryEl.style.display = 'none';
+  }
+  renderResults(data.companies, data.required_quantity);
+  resultsPanel.style.display = '';
+}
+
+async function pollJob(jobId, statusEl) {
+  // Опрашиваем /api/jobs/{id} каждые 3 секунды до завершения.
+  for (let i = 0; i < 600; i++) {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+    if (!r.ok) throw new Error(`Ошибка статуса задачи (${r.status})`);
+    const j = await r.json();
+    if (j.status === 'done') return j.result;
+    if (j.status === 'error') throw new Error(j.error || 'Ошибка поиска');
+    await new Promise((res) => setTimeout(res, 3000));
+  }
+  throw new Error('Слишком долгий поиск — превышено время ожидания.');
+}
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const query = document.getElementById('query').value.trim();
@@ -597,14 +759,16 @@ form.addEventListener('submit', async (e) => {
   const useTrustedSuppliers = document.getElementById('use-trusted-suppliers').checked;
   const checkAvailability = document.getElementById('check-availability').checked;
   const probeStepper = document.getElementById('probe-stepper').checked;
+  // Персональный email для отчёта (на него придёт готовый Excel).
+  const reportEmail = document.getElementById('report-email').value.trim();
 
   submitBtn.disabled = true;
   statusEl.className = '';
   statusEl.textContent = probeStepper
-    ? 'Идёт поиск, краулинг и интерактивная проверка степперов в браузере — это может занять заметно дольше…'
+    ? 'Запускаем поиск (с проверкой степперов) — результат появится, когда будет готов…'
     : deepRelevance
-    ? 'Идёт поиск и краулинг сайтов кандидатов — это может занять несколько минут…'
-    : 'Идёт поиск…';
+    ? 'Запускаем поиск с краулингом сайтов — это может занять несколько минут, результат появится автоматически…'
+    : 'Запускаем поиск…';
   resultsPanel.style.display = 'none';
 
   try {
@@ -613,6 +777,7 @@ form.addEventListener('submit', async (e) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         query,
+        email: reportEmail || null,
         use_llm_fallback: useLlm,
         deep_relevance: deepRelevance,
         relevance_llm_check: relevanceLlmCheck,
@@ -625,22 +790,11 @@ form.addEventListener('submit', async (e) => {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.detail || `Ошибка ${resp.status}`);
     }
-    const data = await resp.json();
-    statusEl.textContent = `Готово: найдено ${data.companies.length} компаний.`;
-    resultsMeta.textContent = `— «${data.report.query}»`;
-    const summaryEl = document.getElementById('availability-summary');
-    if (data.availability_summary) {
-      summaryEl.textContent = data.availability_summary;
-      summaryEl.style.display = '';
-    } else {
-      summaryEl.style.display = 'none';
-    }
-    renderResults(data.companies, data.required_quantity);
+    const data = await resp.json(); // { job_id, status: pending }
+    const result = await pollJob(data.job_id, statusEl);
+    renderSearchResult(result);
     await loadReports();
-    // Поиск с use_trusted_suppliers мог дописать новые домены в базу
-    // (см. pipeline._write_back_trusted_suppliers) — обновляем таблицу,
-    // даже если галочка не стояла: безвредный лишний fetch, зато таблица
-    // никогда не показывает устаревшие данные после поиска.
+    // Поиск с use_trusted_suppliers мог дописать новые домены в базу.
     await loadTrustedSuppliers();
   } catch (err) {
     statusEl.className = 'error';
@@ -654,5 +808,9 @@ loadReports();
 loadTrustedSuppliers();
 loadCategoriesIntoSelect();
 </script>
+<!-- Обратная связь по отчётам (модуль feedback.py): привязка кнопки
+     #feedback-btn, открытие формы оценки, панель просмотра отзывов.
+     Отдельный файл — чтобы не дублировать логику в основном скрипте. -->
+<script src="/feedback.js"></script>
 </body>
 </html>

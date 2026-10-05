@@ -22,7 +22,10 @@ YANDEX_FM_FOLDER_ID, если задан, иначе из уже существ�
 
 from __future__ import annotations
 
+import base64
+import json
 import os
+import re
 
 from pydantic import BaseModel
 
@@ -129,6 +132,108 @@ def _ask_json(
     )
     raw_json = response.choices[0].message.content
     return output_model.model_validate_json(raw_json)
+
+
+def _default_multimodal_model() -> str | None:
+    """Собирает URI мультимодальной модели (gpt://<folder>/<id>/latest) — как
+    _default_model, но для фото (см. _ask_image). id берётся из
+    YANDEX_MULTIMODAL_MODEL (по умолчанию базовая мультимодальная
+    'qwen3.6-35b'), folder_id — как у _default_model (YANDEX_FM_FOLDER_ID,
+    иначе YANDEX_FOLDER_ID). Возвращает None, если folder_id не задан."""
+    model_id = os.environ.get("YANDEX_MULTIMODAL_MODEL") or "qwen3.6-35b-a3b"
+    folder_id = os.environ.get("YANDEX_FM_FOLDER_ID") or os.environ.get("YANDEX_FOLDER_ID")
+    if not folder_id:
+        return None
+    return f"gpt://{folder_id}/{model_id}/latest"
+
+
+def _ask_image(
+    system_prompt: str,
+    prompt_text: str,
+    image_bytes: bytes,
+    mimetype: str,
+    output_model: type[BaseModel],
+    client=None,
+    model: str | None = None,
+    max_tokens: int | None = None,
+) -> BaseModel:
+    """Мультимодальный аналог _ask_json (см. photo_search.py — поиск по фото).
+
+    Отправляет картинку прямо в мультимодальную модель через OpenAI-совместимый
+    stream (тот же endpoint/ключ/folder_id, что в Yandex AI Studio), картинка
+    передаётся как image_url с data-URI base64. Строгая json_schema-выдача —
+    как в _ask_json (additionalProperties=False).
+
+    user-сообщение здесь — массив:
+      [{"type":"text","text": prompt_text},
+       {"type":"image_url","image_url":{"url":"data:<mime>;base64,<b64>"}}]
+
+    model адресуется так же, как у _ask_json — полный URI gpt://<folder>/<id>/latest,
+    где id = YANDEX_MULTIMODAL_MODEL (по умолчанию qwen3.6-35b), folder = тот же
+    folder_id AI Studio. Либо явный полный model= (например gpt://...).
+    """
+    if model is None:
+        model = _default_multimodal_model()
+    if not model:
+        raise RuntimeError(
+            "Требуется мультимодальная модель: задайте YANDEX_MULTIMODAL_MODEL "
+            "(например 'qwen3.6-35b') и folder_id — YANDEX_FM_FOLDER_ID, иначе "
+            "YANDEX_FOLDER_ID (тот же аккаунт), либо передайте полный model=."
+        )
+    client = client or _client()
+    schema_hint = output_model.model_json_schema()
+    schema_hint["additionalProperties"] = False
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    kwargs: dict = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_text},
+                    {"type": "image_url", "image_url": {"url": f"data:{mimetype};base64,{b64}"}},
+                ],
+            },
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": output_model.__name__, "schema": schema_hint, "strict": True},
+        },
+    }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    response = client.chat.completions.create(**kwargs)
+    message = response.choices[0].message
+    # У reasoning-моделей (qwen3.6-35b-a3b) ответ может лежать в
+    # reasoning_content, а content быть None — берём первое непустое.
+    raw = message.content
+    if not raw:
+        raw = getattr(message, "reasoning_content", None)
+    if not raw:
+        raise RuntimeError("Мультимодальная модель вернула пустой ответ")
+
+    # Строгий парсинг через json_schema-контракт; если модель вернула обрезанный
+    # JSON (reasoning-модель упёрлась в лимит токенов) — пробуем вытащить
+    # keywords вручную, чтобы всё же получить поисковое ядро.
+    try:
+        return output_model.model_validate_json(raw)
+    except Exception:  # noqa: BLE001 — ломаный JSON
+        m = re.search(r'"keywords"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+        if m:
+            # Снимаем только JSON-экранирование (\" и \\u), НЕ трогая кодировку:
+            # encode+unicode_escape портил кириллицу (Ð¼Ð¾Ñ...).
+            try:
+                keywords = json.loads('"' + m.group(1) + '"')
+            except Exception:  # noqa: BLE001 — если экранирование некорректно
+                keywords = m.group(1)
+            # Вернём экземпляр схемы с минимально заполненными полями.
+            data = {"keywords": keywords, "reasoning": ""}
+            # used_text/other поля — заполним пустыми, если они есть в схеме.
+            for f in output_model.model_fields.keys():
+                data.setdefault(f, "" if f != "keywords" else keywords)
+            return output_model(**data)
+        raise
 
 
 def classify_relevance_with_yandexgpt(

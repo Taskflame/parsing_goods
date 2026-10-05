@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
